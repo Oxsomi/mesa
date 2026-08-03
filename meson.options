@@ -915,3 +915,10 @@ option(
   value : false,
   description : 'Build panfrost Rust components.'
 )
+
+option(
+  'spirv2isa',
+  type : 'boolean',
+  value : false,
+  description : 'Build the standalone SPIR-V -> AMD ISA library (OxC3 offline ISA layer)'
+)

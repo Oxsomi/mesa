@@ -30,3 +30,7 @@ if with_gallium_radeonsi
   subdir('gmlib')
   subdir('lanczoslib')
 endif
+
+if with_amd_vk and get_option('spirv2isa')
+  subdir('spirv2isa')
+endif
