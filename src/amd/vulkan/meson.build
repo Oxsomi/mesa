@@ -275,6 +275,13 @@ if radv_u_trace
   radv_flags += '-DRADV_U_TRACE=1'
 endif
 
+# OxC3: fold the standalone SPIR-V->ISA glue into RADV's own compilation so it can call the internal,
+# device-free radv_* compile functions (radv_get_nir_options / radv_declare_shader_args /
+# radv_postprocess_nir) directly. Gated, never present in a normal build.
+if get_option('spirv2isa')
+  libradv_files += files('../spirv2isa/spirv2isa.c')
+endif
+
 libvulkan_radeon = shared_library(
   'vulkan_radeon',
   [libradv_files, radv_entrypoints, radv_drirc, sha1_h, radix_sort_spv, bvh_spv, radv_annotate_layer],
