@@ -55,6 +55,37 @@ typedef enum s2i_stage {
    S2I_STAGE_COUNT
 } s2i_stage;
 
+/*
+ * Descriptor binding, supplied by the caller (OxC3 has the full binding layout from its oiSH
+ * reflection). We build the RADV descriptor set layouts the SPIR-V descriptor lowering needs from
+ * these, instead of guessing a generic layout. The type drives how the descriptor is lowered (a
+ * buffer, an image, a sampler, an acceleration structure...); the set/binding place it so the
+ * SPIR-V's DescriptorSet/Binding decorations resolve. Mirrors VkDescriptorType 1:1.
+ */
+typedef enum s2i_descriptor_type {
+   S2I_DESC_SAMPLER = 0,
+   S2I_DESC_COMBINED_IMAGE_SAMPLER,
+   S2I_DESC_SAMPLED_IMAGE,
+   S2I_DESC_STORAGE_IMAGE,
+   S2I_DESC_UNIFORM_TEXEL_BUFFER,
+   S2I_DESC_STORAGE_TEXEL_BUFFER,
+   S2I_DESC_UNIFORM_BUFFER,
+   S2I_DESC_STORAGE_BUFFER,
+   S2I_DESC_UNIFORM_BUFFER_DYNAMIC,
+   S2I_DESC_STORAGE_BUFFER_DYNAMIC,
+   S2I_DESC_INPUT_ATTACHMENT,
+   S2I_DESC_INLINE_UNIFORM_BLOCK,
+   S2I_DESC_ACCELERATION_STRUCTURE,
+   S2I_DESC_TYPE_COUNT
+} s2i_descriptor_type;
+
+typedef struct s2i_binding {
+   uint32_t set;                 /* descriptor set index (0..31) */
+   uint32_t binding;             /* binding number within the set */
+   uint32_t count;               /* array size; 0 is treated as 1 */
+   s2i_descriptor_type type;
+} s2i_binding;
+
 typedef struct s2i_stats {
    uint32_t sgprs, vgprs;             /* actual usage (pre-scheduling), comparable to LLPC's used counts */
    uint32_t spilled_sgprs, spilled_vgprs;
@@ -63,9 +94,29 @@ typedef struct s2i_stats {
    uint32_t instructions;
 } s2i_stats;
 
+/* How a ray tracing shader was lowered. In a real pipeline RADV inlines the whole pipeline into the
+ * raygen (monolithic) only if every shader is inlinable and there are < 50 of them; otherwise each
+ * shader compiles standalone (the leaner FUNCTION_CALLS / CPS path) and links through the SBT plus a
+ * shared traversal shader. NA for non-RT stages. */
+typedef enum s2i_rt_mode {
+   S2I_RT_MODE_NA = 0,
+   S2I_RT_MODE_MONOLITHIC,      /* callees inlined into raygen; no separate traversal shader */
+   S2I_RT_MODE_FUNCTION_CALLS,  /* standalone/lean; pipeline links via SBT + a traversal shader */
+   S2I_RT_MODE_CPS              /* continuation-passing variant of the standalone path */
+} s2i_rt_mode;
+
+/* Extra facts about the compile the caller may want to surface (all optional; pass NULL to skip). */
+typedef struct s2i_info {
+   s2i_rt_mode rt_mode;        /* how this shader was compiled (NA for non-RT) */
+   uint8_t rt_can_inline;      /* 1 if a whole-pipeline compile could inline this shader: raygen/any-hit/
+                                * intersection always, miss/closest-hit unless they recurse (traceRay),
+                                * callable never. 0 otherwise / not an RT shader. */
+   uint8_t graphics_specialized; /* 1 if a graphics PSO state was applied (baked-in), 0 = unlinked/dynamic */
+} s2i_info;
+
 typedef enum s2i_result {
    S2I_OK = 0,
-   S2I_BAD_SPIRV,        /* not a SPIR-V module / parse failure */
+   S2I_BAD_SPIRV,        /* not a SPIR-V module / bad arguments */
    S2I_UNSUPPORTED_CAP,  /* module uses a capability the target doesn't support (see *message) */
    S2I_NO_ENTRYPOINT,    /* named entry not found in the module */
    S2I_COMPILE_FAILED    /* lowering/ACO failed (see *message) */
@@ -73,18 +124,45 @@ typedef enum s2i_result {
 
 /*
  * Compile one entrypoint of a SPIR-V module to AMD ISA text (+ optional stats), for `target`.
- * The caller (OxC3) supplies `entry` and `stage`, we never scan the SPIR-V to derive them, since
- * OxC3 already knows both from the oiSH; that keeps this layer thin and non-fragile.
- *   entry     : entrypoint name (required, OxC3 always has it).
- *   stage     : the pipeline stage (OxC3 maps ESHPipelineStage -> s2i_stage).
- *   isa_text  : out, malloc'd disassembly text (caller frees) on S2I_OK.
- *   stats     : out, optional (may be NULL).
- *   message   : out, optional diagnostic string on error, malloc'd (caller frees if non-NULL).
- * spirv_to_nir validates against the target's supported capability set, so an unsupported feature
- * yields a clean S2I_UNSUPPORTED_CAP + message instead of a crash.
+ * The caller (OxC3) supplies everything it already knows from the oiSH so this layer never has to
+ * scan the SPIR-V: the entrypoint name, the stage, and the descriptor binding layout. That keeps it
+ * thin and non-fragile.
+ *   entry         : entrypoint name (required, OxC3 always has it).
+ *   stage         : the pipeline stage (OxC3 maps ESHPipelineStage -> s2i_stage).
+ *   bindings      : descriptor bindings the module uses (may be NULL for none / a quick test, in
+ *                   which case a permissive generic layout is synthesized as a fallback).
+ *   binding_count : number of entries in `bindings`.
+ *   isa_text      : out, malloc'd disassembly text (caller frees) on S2I_OK.
+ *   stats         : out, optional (may be NULL).
+ *   info          : out, optional (may be NULL) compile facts: RT mode / inlinability / specialization.
+ *   message       : out, optional diagnostic string on error, malloc'd (caller frees if non-NULL).
  */
 s2i_result s2i_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2i_stage stage,
-                       s2i_target target, char **isa_text, s2i_stats *stats, char **message);
+                       s2i_target target, const s2i_binding *bindings, size_t binding_count,
+                       char **isa_text, s2i_stats *stats, s2i_info *info, char **message);
+
+/* One shader of a ray tracing pipeline, for the whole-pipeline (monolithic) compile below. */
+typedef struct s2i_rt_shader {
+   const uint32_t *spirv;
+   size_t spirv_words;
+   const char *entry;
+   s2i_stage stage; /* raygen / miss / closest_hit / any_hit / intersection / callable */
+} s2i_rt_shader;
+
+/*
+ * Whole-pipeline ray tracing compile: takes all the pipeline's shaders (raygen + its callees: miss,
+ * hit, callable, ...).
+ *   compile_traversal = 0: compile shaders[entry_index] (must be a raygen) MONOLITHICALLY, so its
+ *     traceRay/executeCallable calls are inlined from the other shaders. That is the single baked
+ *     shader the driver runs in monolithic mode.
+ *   compile_traversal = 1: build and compile the pipeline's TRAVERSAL shader (the BVH walk that a
+ *     non-monolithic / function-calls pipeline runs as a separate stage, called by the raygen);
+ *     entry_index is ignored. Per-shader ISA for the others is s2i_compile (function-calls mode).
+ * Each shader may use the same descriptor `bindings`. isa_text/stats/message as in s2i_compile.
+ */
+s2i_result s2i_compile_rt_pipeline(const s2i_rt_shader *shaders, size_t shader_count, size_t entry_index,
+                                   int compile_traversal, s2i_target target, const s2i_binding *bindings,
+                                   size_t binding_count, char **isa_text, s2i_stats *stats, char **message);
 
 /*
  * Pre-flight feature check for a cross-vendor/-target support matrix, WITHOUT re-parsing SPIR-V:

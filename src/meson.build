@@ -98,7 +98,7 @@ endif
 if with_imagination_vk or with_tools.contains('imagination')
   subdir('imagination')
 endif
-if with_any_intel
+if with_any_intel or get_option('spirv2isa')
   subdir('intel')
 endif
 if with_gallium_panfrost or with_gallium_lima or with_panfrost_vk or with_tools.contains('panfrost')
