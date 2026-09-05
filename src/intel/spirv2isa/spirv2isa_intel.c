@@ -27,6 +27,7 @@
 #include "compiler/spirv/nir_spirv.h"     /* spirv_to_nir + options */
 #include "compiler/spirv/spirv_info.h"    /* struct spirv_capabilities */
 #include "brw_compiler.h"                  /* brw_compiler_create, brw_compile, prog_data/key */
+#include "brw_reg.h"                       /* REG_SIZE, the push-constant granularity */
 #include "brw_nir.h"                       /* brw_preprocess_nir, brw_nir_lower_cs_intrinsics, brw_nir_lower_cmat */
 #include "brw_nir_rt.h"                    /* brw_nir_lower_ray_queries (inline ray tracing) */
 
@@ -37,6 +38,25 @@
 #define S2I_INTEL_SURFACE_STATE_SIZE 64
 #define S2I_INTEL_SAMPLER_STATE_SIZE 32
 #define S2I_INTEL_DESC_HEAP_STRIDE   0x10000
+
+/* A descriptor's (set, binding) is flattened into one small id, which is what both the binding table
+ * index and the synthetic heap offset are built from. The flattening only holds while the inputs stay
+ * inside these bounds: past them two different resources would land on one id, and a binding table
+ * index would run past the table itself. A real driver has no such limit because it assigns indices
+ * densely at pipeline layout time; offline we refuse rather than alias.
+ * S2I_INTEL_BINDINGS_PER_SET sharing a value with S2I_INTEL_SURFACE_STATE_SIZE is a coincidence: that
+ * one is the hardware state size, this one is how many bindings a set may hold. */
+#define S2I_INTEL_BINDINGS_PER_SET 64
+#define S2I_INTEL_MAX_BTI          240
+
+static bool
+s2i_intel_binding_fits(unsigned set, unsigned binding)
+{
+   if (binding >= S2I_INTEL_BINDINGS_PER_SET)
+      return false;
+
+   return set * S2I_INTEL_BINDINGS_PER_SET + binding < S2I_INTEL_MAX_BTI;
+}
 
 struct s2i_intel_target_desc {
    int pci_id;
@@ -199,32 +219,56 @@ s2i_intel_gate_extensions(s2i_features features, const char *target_name, char *
  * vulkan_resource_index becomes a synthetic per-binding base address and nir_lower_explicit_io then
  * turns the buffer access into ordinary global (A64) loads/stores - no surface, no binding table. The
  * addresses are placeholders; the emitted memory instructions (the ISA we care about) are real.
- * Images/samplers still need surface handles and are rejected before here. */
+ * This is the one resource class whose lowering is NOT the shape a real driver emits, so a compile
+ * that uses it reports s2i_info.descriptors_stateless; images and samplers below do use the driver's
+ * own binding-table and bindless forms.
+ * `data` is an optional `bool *` set when a BUFFER descriptor was rewritten. The pass also lowers
+ * driver-supplied values that brw cannot emit itself, and those say nothing about buffer fidelity, so
+ * the flag is not the pass's own progress. */
 static bool
 s2i_intel_lower_buffer_desc(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
+   bool *lowered_buffer = data;
+
    b->cursor = nir_before_instr(&intr->instr);
    switch (intr->intrinsic) {
    case nir_intrinsic_vulkan_resource_index: {
       unsigned set = nir_intrinsic_desc_set(intr);
       unsigned binding = nir_intrinsic_binding(intr);
-      nir_def *base = nir_imm_int64(b, 0x100000000ull + ((uint64_t)set * 64 + binding) * 0x10000ull);
+      const uint64_t id = (uint64_t)set * S2I_INTEL_BINDINGS_PER_SET + binding;
+      nir_def *base = nir_imm_int64(b, 0x100000000ull + id * S2I_INTEL_DESC_HEAP_STRIDE);
       nir_def *addr = nir_iadd(b, base, nir_u2u64(b, nir_imul_imm(b, intr->src[0].ssa, 0x1000)));
       nir_def_replace(&intr->def, addr);
+
+      if (lowered_buffer)
+         *lowered_buffer = true;
+
       return true;
    }
    case nir_intrinsic_vulkan_resource_reindex: {
       nir_def *addr = nir_iadd(b, intr->src[0].ssa,
                                nir_u2u64(b, nir_imul_imm(b, intr->src[1].ssa, 0x1000)));
       nir_def_replace(&intr->def, addr);
+
+      if (lowered_buffer)
+         *lowered_buffer = true;
+
       return true;
    }
    case nir_intrinsic_load_vulkan_descriptor:
       nir_def_replace(&intr->def, intr->src[0].ssa);
+
+      if (lowered_buffer)
+         *lowered_buffer = true;
+
       return true;
    case nir_intrinsic_get_ssbo_size:
       /* Stateless A64 carries no buffer size; give OpArrayLength a synthetic one (placeholder). */
       nir_def_replace(&intr->def, nir_imm_int(b, 0x10000));
+
+      if (lowered_buffer)
+         *lowered_buffer = true;
+
       return true;
    case nir_intrinsic_load_base_workgroup_id:
       /* brw does not emit this directly (a driver lowers it); no dispatch base offline, so it is 0. */
@@ -299,7 +343,7 @@ s2i_intel_lower_image_desc(nir_builder *b, nir_intrinsic_instr *intr, void *data
    nir_variable *var = s2i_intel_deref_binding(nir_src_as_deref(intr->src[0]), &array_index);
    if (!var)
       return false;
-   uint32_t base = var->data.descriptor_set * 64 + var->data.binding;
+   uint32_t base = var->data.descriptor_set * S2I_INTEL_BINDINGS_PER_SET + var->data.binding;
 
    b->cursor = nir_before_instr(&intr->instr);
 
@@ -316,7 +360,8 @@ s2i_intel_lower_image_desc(nir_builder *b, nir_intrinsic_instr *intr, void *data
 /* Device-free SAMPLED-TEXTURE lowering, the tex-instruction analogue of the storage-image pass above.
  * brw wants a texture/sampler_deref replaced by a texture/sampler_offset (a binding-table index added
  * to tex->texture_index) or a *_handle (bindless). ANV builds these from the pipeline layout in
- * lower_tex_deref; we synthesize the same constant binding-table index (set * 64 + binding + array).
+ * lower_tex_deref; we synthesize the same constant binding-table index (set, binding and array index
+ * flattened the same way the storage-image pass above flattens them).
  * A combined image sampler resolves both derefs to the same binding; separate ones use their own. */
 static bool
 s2i_intel_lower_tex_deref(nir_builder *b, nir_tex_instr *tex, nir_tex_src_type deref_type)
@@ -330,7 +375,7 @@ s2i_intel_lower_tex_deref(nir_builder *b, nir_tex_instr *tex, nir_tex_src_type d
    if (!var)
       return false;
    const bool is_sampler = deref_type == nir_tex_src_sampler_deref;
-   uint32_t base = var->data.descriptor_set * 64 + var->data.binding;
+   uint32_t base = var->data.descriptor_set * S2I_INTEL_BINDINGS_PER_SET + var->data.binding;
 
    nir_def *index;
    nir_tex_src_type new_type;
@@ -370,11 +415,64 @@ s2i_intel_lower_tex(nir_builder *b, nir_instr *instr, void *data)
    return progress;
 }
 
+/* Every resource intrinsic that must be gone by the time brw sees the shader. brw_from_nir has no
+ * default case, so anything left here would abort inside the backend with no explanation; naming it
+ * turns that into an ordinary refusal. image_heap_* is the descriptor-heap form vtn emits instead of
+ * image_deref_* for a resource-heap variable, which nothing here lowers yet. */
+static bool
+s2i_intel_is_unlowered_resource(nir_intrinsic_op op)
+{
+   switch (op) {
+   case nir_intrinsic_vulkan_resource_index:
+   case nir_intrinsic_vulkan_resource_reindex:
+   case nir_intrinsic_load_vulkan_descriptor:
+   case nir_intrinsic_image_deref_load:
+   case nir_intrinsic_image_deref_store:
+   case nir_intrinsic_image_deref_atomic:
+   case nir_intrinsic_image_deref_atomic_swap:
+   case nir_intrinsic_image_deref_size:
+   case nir_intrinsic_image_deref_samples:
+   case nir_intrinsic_image_deref_sparse_load:
+   case nir_intrinsic_image_heap_load:
+   case nir_intrinsic_image_heap_store:
+   case nir_intrinsic_image_heap_atomic:
+   case nir_intrinsic_image_heap_atomic_swap:
+   case nir_intrinsic_image_heap_size:
+   case nir_intrinsic_image_heap_samples:
+   case nir_intrinsic_image_heap_sparse_load:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* Name of the first resource intrinsic nothing lowered, or NULL when the shader is ready for brw. */
+static const char *
+s2i_intel_first_unlowered(nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+
+            const nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+
+            if (s2i_intel_is_unlowered_resource(op))
+               return nir_intrinsic_infos[op].name;
+         }
+      }
+   }
+
+   return NULL;
+}
+
 s2i_result
 s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2i_stage stage,
                   int target_index, const s2i_binding *bindings, size_t binding_count,
                   s2i_features features_used, char **isa_text, s2i_stats_intel *stats,
-                  char **message)
+                  s2i_info *info, char **message)
 {
    if (isa_text)
       *isa_text = NULL;
@@ -387,12 +485,24 @@ s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, 
        stage >= S2I_STAGE_COUNT)
       return S2I_BAD_SPIRV;
 
-   /* Descriptor bindings are not lowered by this backend yet, so a module that needs them is refused
-    * rather than compiled into something that cannot bind. */
-   if (bindings && binding_count > 0) {
-      if (message)
-         *message = strdup("Intel descriptor binding lowering is not wired yet; this backend cannot "
-                           "compile a module with caller-supplied descriptor bindings");
+   /* This backend places every resource from the module's own set/binding decorations, so a supplied
+    * layout is not consumed; it is checked, because a binding this backend could not flatten would
+    * otherwise be discovered as wrong ISA rather than as an error. */
+   for (size_t i = 0; i < binding_count; i++) {
+
+      if (!bindings || s2i_intel_binding_fits(bindings[i].set, bindings[i].binding))
+         continue;
+
+      if (message) {
+         char buf[192];
+         snprintf(buf, sizeof(buf),
+                  "descriptor set %u binding %u is outside what this backend can flatten "
+                  "(binding < %u, and set * %u + binding < %u)",
+                  bindings[i].set, bindings[i].binding, S2I_INTEL_BINDINGS_PER_SET,
+                  S2I_INTEL_BINDINGS_PER_SET, S2I_INTEL_MAX_BTI);
+         *message = strdup(buf);
+      }
+
       return S2I_UNSUPPORTED_CAP;
    }
 
@@ -438,9 +548,13 @@ s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, 
    /* mem_alignment is normally filled by the i915/xe kernel driver from a DRM query; the device-free
     * PCI-id path leaves it 0, which makes brw's mem-access vectorizer compute align(end, MIN2(.., 0))
     * and hit a util_is_power_of_two assert (only when adjacent accesses actually vectorize, e.g. a ray
-    * query's spilled struct). 4096 is the device-free test default (intel/vulkan/tests/test_common.h). */
+    * query's spilled struct).
+    * This is not a free constant: brw_nir.c's vectorizer refuses to widen a global load whose result
+    * would cross it, so it decides how many buffer loads merge, and therefore the instruction count.
+    * Derive it the way the kernel does (i915/intel_device_info.c), which is device-free: 64 KB from
+    * Xe-HPG on and for anything with local memory, 4 KB before that. */
    if (devinfo.mem_alignment == 0)
-      devinfo.mem_alignment = 4096;
+      devinfo.mem_alignment = (devinfo.verx10 >= 125 || devinfo.has_local_mem) ? 64 * 1024 : 4096;
    struct brw_compiler *compiler = brw_compiler_create(mem_ctx, &devinfo);
    compiler->shader_debug_log = s2i_intel_log_noop;
    compiler->shader_perf_log = s2i_intel_log_noop;
@@ -513,8 +627,12 @@ s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, 
    }
 
    /* Lower UBO/SSBO descriptors to synthetic global addresses, then to stateless A64 global access,
-    * then clean up so brw sees well-formed load/store_global intrinsics. */
-   NIR_PASS(_, nir, nir_shader_intrinsics_pass, s2i_intel_lower_buffer_desc, nir_metadata_none, NULL);
+    * then clean up so brw sees well-formed load/store_global intrinsics.
+    * Whether a buffer was rewritten is what the caller is told through s2i_info: a shader that touches
+    * no buffer is unaffected by the shortcut, one that does cannot be compared against hardware. */
+   bool stateless_buffers = false;
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, s2i_intel_lower_buffer_desc, nir_metadata_none,
+            &stateless_buffers);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo | nir_var_mem_ubo,
             nir_address_format_64bit_global);
    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
@@ -568,6 +686,28 @@ s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, 
 
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 
+   /* Refuse by name anything resource shaped that no pass above claimed, instead of letting brw abort
+    * on an intrinsic it has no case for. A descriptor-heap module reaches here this way. */
+
+   const char *unlowered = s2i_intel_first_unlowered(nir);
+
+   if (unlowered) {
+
+      if (message) {
+         char buf[192];
+         snprintf(buf, sizeof(buf), "%s is not lowered by this backend yet, so the module cannot be "
+                                    "compiled device-free", unlowered);
+         *message = strdup(buf);
+      }
+
+      glsl_type_singleton_decref();
+      ralloc_free(mem_ctx);
+      return S2I_UNSUPPORTED_CAP;
+   }
+
+   if (info)
+      info->descriptors_stateless = stateless_buffers ? 1 : 0;
+
    /* Per-stage prog_data + key. brw_compile dispatches by nir->info.stage, so we use brw's own unions
     * (brw_compiler.h) which are sized for every stage it can dispatch to. */
    union brw_any_prog_data prog_data;
@@ -581,9 +721,26 @@ s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, 
 
    if (ms == MESA_SHADER_COMPUTE) {
       brw_nir_lower_cs_intrinsics(nir, &devinfo, &prog_data.cs);
+
       /* brw_nir_lower_cs_intrinsics introduces load_base_workgroup_id; lower it now (blorp does the
        * same right after this call). Re-running the pass only matches that intrinsic here. */
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, s2i_intel_lower_buffer_desc, nir_metadata_none, NULL);
+
+      /* It also introduces load_subgroup_id, which only Xe-HPG and later take from the thread payload.
+       * Before that the driver pushes the value as a constant, and brw asserts instead of emitting
+       * anything when nothing has lowered it, so any workgroup-relative builtin would abort the process.
+       * Nothing else claims push data here, so it goes at offset 0, as iris does. */
+      bool subgroup_id_pushed = false;
+      NIR_PASS(subgroup_id_pushed, nir, brw_nir_lower_cs_subgroup_id, &devinfo, 0);
+
+      if (subgroup_id_pushed) {
+         prog_data.cs.base.push_sizes[0] = sizeof(uint32_t);
+         brw_cs_fill_push_const_info(&devinfo, &prog_data.cs, 0);
+         prog_data.cs.base.push_sizes[0] = ALIGN_POT(sizeof(uint32_t), REG_SIZE);
+      } else {
+         brw_cs_fill_push_const_info(&devinfo, &prog_data.cs, -1);
+      }
+
       base_prog_data = &prog_data.cs.base;
       base_prog_key = &prog_key.cs.base;
    } else if (ms == MESA_SHADER_FRAGMENT) {

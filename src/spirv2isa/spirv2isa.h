@@ -258,6 +258,12 @@ typedef struct s2i_info {
                                 * intersection always, miss/closest-hit unless they recurse (traceRay),
                                 * callable never. 0 otherwise / not an RT shader. */
    uint8_t graphics_specialized; /* 1 if a graphics PSO state was applied (baked-in), 0 = unlinked/dynamic */
+   uint8_t descriptors_stateless; /* 1 if buffer descriptors were lowered to raw addresses instead of the
+                                   * driver's own descriptor access. The instructions are real, but the
+                                   * memory messages and the register pressure they cost are NOT what a
+                                   * driver would emit, so a caller comparing against hardware has to
+                                   * know. 0 when the shader touches no buffers, or once a backend
+                                   * lowers them the way its driver does. */
 } s2i_info;
 
 typedef enum s2i_result {
@@ -279,8 +285,10 @@ typedef enum s2i_result {
  *   stage         : the pipeline stage (OxC3 maps ESHPipelineStage -> s2i_stage).
  *   bindings      : descriptor bindings the module uses (may be NULL for none / a quick test, in
  *                   which case a permissive generic layout is synthesized as a fallback). A backend
- *                   whose descriptor lowering isn't wired yet returns S2I_UNSUPPORTED_CAP for a
- *                   module that needs them rather than compiling something that cannot bind.
+ *                   that builds a descriptor layout consumes this; one that places resources from
+ *                   the module's own decorations only validates it. Either way a module needing a
+ *                   binding form the backend cannot lower is S2I_UNSUPPORTED_CAP rather than ISA
+ *                   that cannot bind, and s2i_info reports where a lowering diverges from a driver.
  *   binding_count : number of entries in `bindings`.
  *   features_used : which features the module uses, as an OR of s2i_feature (above),
  *                   or 0 if not declared. The CALLER translates its own feature enum into these; OxC3

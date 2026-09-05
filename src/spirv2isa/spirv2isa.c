@@ -191,15 +191,15 @@ s2i_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2i_st
 #ifdef S2I_HAVE_INTEL
    case S2I_VENDOR_INTEL:
 
-      /* Intel has no RT lowering yet, so the RT facts stay at their defaults rather than reading as
-       * a monolithic compile that never happened. */
+      /* Intel reports no RT mode of its own, so those fields keep their defaults rather than reading
+       * as a monolithic compile that never happened; the backend fills in the rest. */
 
       if (info)
          memset(info, 0, sizeof(*info));
 
       result = s2i_intel_compile(spirv, spirv_words, entry, stage, S2I_TARGET_INDEX_OF(target), bindings,
                                  binding_count, features_used, isa_text, stats ? &stats->intel : NULL,
-                                 message);
+                                 info, message);
       break;
 #endif
 

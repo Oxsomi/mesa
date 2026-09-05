@@ -9,9 +9,9 @@
  * Intel's compiler is a pure function of an intel_device_info (built from the target's PCI id,
  * device-free) plus NIR: brw_compiler_create(devinfo) then brw_compile().
  *
- * This is the first slice: compute, descriptor-free modules (arithmetic / builtins / push consts).
- * A module that needs descriptors is refused rather than compiled into something that cannot bind,
- * until binding-table lowering lands; graphics and RT stages follow, mirroring the AMD backend.
+ * This is the first slice: compute. Buffers, images and samplers are placed from the module's own
+ * set/binding decorations; anything resource shaped that no pass here claims is refused by name
+ * rather than reaching brw. Graphics and RT stages follow, mirroring the AMD backend.
  */
 #ifndef SPIRV2ISA_INTEL_H
 #define SPIRV2ISA_INTEL_H
@@ -23,11 +23,12 @@ extern "C" {
 #endif
 
 /* s2i_compile for an Intel target, taking Intel's own stats. See s2i_compile for the arguments.
- * `bindings` is refused with S2I_UNSUPPORTED_CAP while binding-table lowering isn't wired. */
+ * `bindings` is validated, not consumed: placement comes from the module's own decorations, so a
+ * binding this backend cannot flatten is S2I_UNSUPPORTED_CAP instead of ISA that cannot bind. */
 s2i_result s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2i_stage stage,
                              int target_index, const s2i_binding *bindings, size_t binding_count,
                              s2i_features features_used, char **isa_text, s2i_stats_intel *stats,
-                             char **message);
+                             s2i_info *info, char **message);
 
 /* Human-readable name of an Intel target, "" when the index isn't one. */
 const char *s2i_intel_target_name(int target_index);
