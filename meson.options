@@ -920,5 +920,13 @@ option(
   'spirv2isa',
   type : 'boolean',
   value : false,
-  description : 'Build the standalone SPIR-V -> AMD ISA library (OxC3 offline ISA layer)'
+  description : 'Build the standalone device-free SPIR-V -> ISA library (OxC3 offline ISA layer)'
+)
+
+option(
+  'spirv2isa-backends',
+  type : 'array',
+  choices : ['amd', 'intel'],
+  value : ['amd', 'intel'],
+  description : 'Which spirv2isa backends to build; one of them is enough to get a library'
 )

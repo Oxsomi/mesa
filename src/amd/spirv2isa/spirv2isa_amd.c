@@ -13,7 +13,7 @@
  * The caller (OxC3) supplies entry + stage + the descriptor binding layout; we never scan the SPIR-V.
  */
 
-#include "spirv2isa.h"
+#include "spirv2isa_amd.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -58,21 +58,21 @@ struct s2i_target_desc {
    const char *name;
 };
 
-static const struct s2i_target_desc s2i_targets[S2I_TARGET_COUNT] = {
-   [S2I_TARGET_GFX8_POLARIS10] = { GFX8,    CHIP_POLARIS10, "gfx803 (GCN4, RX 580)" },
-   [S2I_TARGET_GFX9_VEGA10]    = { GFX9,    CHIP_VEGA10,    "gfx900 (GCN5, RX Vega)" },
-   [S2I_TARGET_GFX10_NAVI10]   = { GFX10,   CHIP_NAVI10,    "gfx1010 (RDNA1, RX 5700 XT)" },
-   [S2I_TARGET_GFX10_3_NAVI21] = { GFX10_3, CHIP_NAVI21,    "gfx1030 (RDNA2, RX 6800/6700 XT class)" },
-   [S2I_TARGET_GFX11_NAVI31]   = { GFX11,   CHIP_NAVI31,    "gfx1100 (RDNA3, RX 7900 XTX)" },
-   [S2I_TARGET_GFX12_GFX1201]  = { GFX12,   CHIP_GFX1201,   "gfx1201 (RDNA4, RX 9070 XT)" },
+static const struct s2i_target_desc s2i_amd_targets[S2I_TARGET_AMD_COUNT] = {
+   [S2I_TARGET_INDEX_OF(S2I_TARGET_GFX8_POLARIS10)] = { GFX8,    CHIP_POLARIS10, "gfx803 (GCN4, RX 580)" },
+   [S2I_TARGET_INDEX_OF(S2I_TARGET_GFX9_VEGA10)]    = { GFX9,    CHIP_VEGA10,    "gfx900 (GCN5, RX Vega)" },
+   [S2I_TARGET_INDEX_OF(S2I_TARGET_GFX10_NAVI10)]   = { GFX10,   CHIP_NAVI10,    "gfx1010 (RDNA1, RX 5700 XT)" },
+   [S2I_TARGET_INDEX_OF(S2I_TARGET_GFX10_3_NAVI21)] = { GFX10_3, CHIP_NAVI21,    "gfx1030 (RDNA2, RX 6800/6700 XT class)" },
+   [S2I_TARGET_INDEX_OF(S2I_TARGET_GFX11_NAVI31)]   = { GFX11,   CHIP_NAVI31,    "gfx1100 (RDNA3, RX 7900 XTX)" },
+   [S2I_TARGET_INDEX_OF(S2I_TARGET_GFX12_GFX1201)]  = { GFX12,   CHIP_GFX1201,   "gfx1201 (RDNA4, RX 9070 XT)" },
 };
 
 const char *
-s2i_target_name(s2i_target target)
+s2i_amd_target_name(int target_index)
 {
-   if (target < 0 || target >= S2I_TARGET_COUNT)
-      return "(invalid)";
-   return s2i_targets[target].name;
+   if (target_index < 0 || target_index >= S2I_TARGET_AMD_COUNT)
+      return "";
+   return s2i_amd_targets[target_index].name;
 }
 
 /* --- stage mapping (caller's s2i_stage -> Mesa mesa_shader_stage; we never derive it) ------- */
@@ -298,7 +298,7 @@ s2i_setup_compiler_info(const struct s2i_target_desc *t, struct radeon_info *rad
 
 /* Copy the stat block + (optionally) the ISA text out of a compiled binary. */
 static void
-s2i_extract(const struct radv_compiler_info *ci, struct radv_shader_binary *bin, s2i_stats *stats,
+s2i_extract(const struct radv_compiler_info *ci, struct radv_shader_binary *bin, s2i_stats_amd *stats,
             char **isa_text)
 {
    /* keep_executable_info recorded the asm and keep_statistic_info the ACO stats into the binary;
@@ -475,12 +475,105 @@ s2i_compile_rt(struct radv_compiler_info *ci, const uint32_t *spirv, size_t spir
    return bin;
 }
 
+/* Defensive scan of the module's declared SPV_* extensions against a small deny-list of features this
+ * backend cannot lower and that would otherwise CRASH deep in spirv_to_nir / a lowering pass instead of
+ * failing cleanly. We only walk the mode-setting prefix (OpExtension appears before the first
+ * OpFunction), reading the null-terminated string operand. This is a robustness guard against arbitrary
+ * SPIR-V, distinct from the caller-fed capability pre-flight (s2i_unsupported_caps); returns the matched
+ * extension name (a static string from `deny`) or NULL. */
+static const char *
+s2i_first_unsupported_ext(const uint32_t *spirv, size_t words, const char *const *deny, size_t deny_count)
+{
+   for (size_t i = 5; i < words;) {
+      uint32_t op = spirv[i] & 0xFFFFu;
+      uint32_t len = spirv[i] >> 16;
+      if (len == 0 || i + len > words)
+         break;
+      if (op == 54 /* OpFunction */) /* extensions/capabilities are all before the first function */
+         break;
+      if (op == 10 /* OpExtension */ && len > 1) {
+         /* The literal is NUL-padded inside this instruction's own words; compare with an explicit
+          * bound so a malformed module with an unterminated literal cannot read past the module. */
+         const char *ext = (const char *)&spirv[i + 1];
+         const size_t avail = (size_t)(len - 1) * 4;
+         if (memchr(ext, '\0', avail)) {
+            for (size_t d = 0; d < deny_count; d++)
+               if (strcmp(ext, deny[d]) == 0)
+                  return deny[d];
+         }
+      }
+      i += len;
+   }
+   return NULL;
+}
+
+/* Features RADV's spirv_to_nir / lowering cannot handle device-free and that crash rather than error:
+ * NV cooperative vector, EXT shader invocation reorder (SER), EXT descriptor heap. (Cooperative matrix
+ * KHR and ray query ARE supported on AMD, so they are not here.) */
+static const char *const s2i_amd_unsupported_exts[] = {
+   "SPV_NV_cooperative_vector",
+   "SPV_EXT_shader_invocation_reorder",
+   "SPV_EXT_descriptor_heap",
+   "SPV_EXT_opacity_micromap",
+};
+
+/* Primary feature gate (the caller-fed mechanism, authoritative). The caller declares which features
+ * the module uses as an s2i_features mask (spirv2isa.h, values owned by us), so this backend
+ * can gate per-target WITHOUT parsing SPIR-V and without knowing anything about the caller's own
+ * feature enum. OxC3 translates its ESHExtension into s2i_feature on its side, deliberately: see the
+ * header for why that direction is the one that fails loudly. */
+enum s2i_support { S2I_SUP_OK, S2I_SUP_NOT_WIRED, S2I_SUP_UNSUPPORTED };
+
+/* Verdict for one feature on `gfx`. Anything not named here is supported device-free on RADV, which
+ * includes ray query, cooperative matrix and bindless descriptor arrays. Every entry was checked
+ * against a real shader with the gate bypassed; do not gate a feature that has not been seen to fail. */
+static enum s2i_support
+s2i_amd_ext_verdict(s2i_feature bit, enum amd_gfx_level gfx, const char **name)
+{
+   switch (bit) {
+   case S2I_FEATURE_COOP_VECTOR:          *name = "cooperative vector (NVIDIA)";          return S2I_SUP_UNSUPPORTED;
+   case S2I_FEATURE_COOP_VECTOR_TRAINING: *name = "cooperative vector training (NVIDIA)"; return S2I_SUP_UNSUPPORTED;
+   case S2I_FEATURE_RAY_REORDER:          *name = "shader execution reorder (SER)";       return S2I_SUP_UNSUPPORTED;
+   case S2I_FEATURE_RAY_MICROMAP_OPACITY: *name = "ray opacity micromap";                 return S2I_SUP_UNSUPPORTED;
+   case S2I_FEATURE_DESCRIPTOR_HEAP:      *name = "descriptor heap";                      return S2I_SUP_NOT_WIRED;
+   case S2I_FEATURE_COOP_FP8:             *name = "cooperative FP8 (needs RDNA4 WMMA)";
+      return gfx >= GFX12 ? S2I_SUP_OK : S2I_SUP_UNSUPPORTED;
+   case S2I_FEATURE_RAY_TRI_POSITION:     *name = "ray triangle position fetch (needs GFX11+)";
+      return gfx >= GFX11 ? S2I_SUP_OK : S2I_SUP_UNSUPPORTED;
+   default:                               return S2I_SUP_OK;
+   }
+}
+
+/* Walk the caller-declared feature set; the first unsupported/not-wired feature -> a clean message +
+ * S2I_UNSUPPORTED_CAP (so the compile never even starts, let alone crashes). Returns true if gated. */
+static bool
+s2i_gate_extensions(s2i_features features, enum amd_gfx_level gfx, const char *target_name, char **message)
+{
+   for (uint32_t b = features; b; b &= b - 1) {
+      uint32_t bit = b & (uint32_t)(-(int32_t)b); /* lowest set bit */
+      const char *name = NULL;
+      enum s2i_support s = s2i_amd_ext_verdict((s2i_feature)bit, gfx, &name);
+      if (s != S2I_SUP_OK) {
+         if (message) {
+            char buf[160];
+            snprintf(buf, sizeof(buf), "%s is %s on %s", name,
+                     s == S2I_SUP_NOT_WIRED ? "not yet supported by this offline compiler"
+                                            : "not supported by this target",
+                     target_name);
+            *message = strdup(buf);
+         }
+         return true;
+      }
+   }
+   return false;
+}
+
 /* --- public API ---------------------------------------------------------------------------- */
 
 s2i_result
-s2i_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2i_stage stage,
-            s2i_target target, const s2i_binding *bindings, size_t binding_count, char **isa_text,
-            s2i_stats *stats, s2i_info *info, char **message)
+s2i_amd_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2i_stage stage,
+                int target_index, const s2i_binding *bindings, size_t binding_count,
+                s2i_features features_used, char **isa_text, s2i_stats_amd *stats, s2i_info *info, char **message)
 {
    if (isa_text)
       *isa_text = NULL;
@@ -494,15 +587,51 @@ s2i_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2i_st
 
    if (!spirv || spirv_words < 5 || spirv[0] != 0x07230203u)
       return S2I_BAD_SPIRV;
-   if (!entry || target < 0 || target >= S2I_TARGET_COUNT || stage < 0 || stage >= S2I_STAGE_COUNT)
+   if (!entry || target_index < 0 || target_index >= S2I_TARGET_AMD_COUNT || stage < 0 || stage >= S2I_STAGE_COUNT)
       return S2I_BAD_SPIRV;
+
+   /* Primary gate: the caller-declared feature set (authoritative; OxC3 translates its oiSH
+    * ESHExtension into s2i_feature). */
+   if (features_used &&
+       s2i_gate_extensions(features_used, s2i_amd_targets[target_index].gfx_level,
+                           s2i_amd_target_name(target_index), message))
+      return S2I_UNSUPPORTED_CAP;
+
+   /* Thin defensive fallback: a caller that declared no features (features_used == 0, e.g. the
+    * CLI) is still protected from the handful of features that crash deep in spirv_to_nir by a scan of
+    * the module's declared SPV_* extension strings. */
+   const char *bad_ext =
+      s2i_first_unsupported_ext(spirv, spirv_words, s2i_amd_unsupported_exts,
+                                ARRAY_SIZE(s2i_amd_unsupported_exts));
+   if (bad_ext) {
+      if (message) {
+         char buf[128];
+         snprintf(buf, sizeof(buf), "unsupported SPIR-V extension for AMD/RADV: %s", bad_ext);
+         *message = strdup(buf);
+      }
+      return S2I_UNSUPPORTED_CAP;
+   }
+
+   /* Mesh and task are NGG-only stages that do not exist before GFX10.3. Enabling key.use_ngg for them
+    * (needed so radv_get_user_data_0 accepts a mesh stage) walks an older target straight into ACO's NGG
+    * path and crashes, so reject here rather than compile something the target cannot express. */
+   if ((s2i_mesa_stage[stage] == MESA_SHADER_MESH || s2i_mesa_stage[stage] == MESA_SHADER_TASK) &&
+       s2i_amd_targets[target_index].gfx_level < GFX10_3) {
+      if (message) {
+         char buf[160];
+         snprintf(buf, sizeof(buf), "mesh and task shaders need GFX10.3 or newer; %s cannot run them",
+                  s2i_amd_target_name(target_index));
+         *message = strdup(buf);
+      }
+      return S2I_UNSUPPORTED_CAP;
+   }
 
    const enum s2i_stage_class cls = s2i_class_of(stage);
 
    /* No device did this for us; the glsl type system uses a singleton linear allocator. */
    glsl_type_singleton_init_or_ref();
 
-   const struct s2i_target_desc *t = &s2i_targets[target];
+   const struct s2i_target_desc *t = &s2i_amd_targets[target_index];
 
    struct radeon_info rad;
    struct radv_compiler_info ci;
@@ -549,6 +678,14 @@ s2i_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2i_st
       /* Graphics: one unlinked stage, exactly like VK_EXT_shader_object compiles a single stage.
        * The other stages stay MESA_SHADER_NONE; gfx_state carries the shader-object dynamic defaults
        * so the (device-free) graphics compile has a valid key to reason about. */
+
+      /* Mesh (and task) shaders are NGG-only. radv_fill_shader_info_ngg sets info.is_ngg (which
+       * radv_get_user_data_0 asserts must be true for a mesh stage) ONLY when key.use_ngg is set - a
+       * real device sets it from pdev->use_ngg. Enable it for these stages so the info pass is valid;
+       * VS/GS stay on their current path to avoid disturbing already-working output. */
+      if (ms == MESA_SHADER_MESH || ms == MESA_SHADER_TASK)
+         ci.key.use_ngg = true;
+
       struct radv_shader_stage stages[MESA_VULKAN_SHADER_STAGES];
       for (unsigned i = 0; i < MESA_VULKAN_SHADER_STAGES; i++) {
          memset(&stages[i], 0, sizeof(stages[i]));
@@ -689,15 +826,16 @@ s2i_rt_shader_to_nir(struct radv_compiler_info *ci, struct radv_shader_layout *l
 }
 
 s2i_result
-s2i_compile_rt_pipeline(const s2i_rt_shader *shaders, size_t shader_count, size_t entry_index,
-                        int compile_traversal, s2i_target target, const s2i_binding *bindings,
-                        size_t binding_count, char **isa_text, s2i_stats *stats, char **message)
+s2i_amd_compile_rt_pipeline(const s2i_rt_shader *shaders, size_t shader_count, size_t entry_index,
+                            int compile_traversal, int target_index, const s2i_binding *bindings,
+                            size_t binding_count, s2i_features features_used, char **isa_text,
+                            s2i_stats_amd *stats, char **message)
 {
    if (isa_text)
       *isa_text = NULL;
    if (message)
       *message = NULL;
-   if (!shaders || shader_count == 0 || target < 0 || target >= S2I_TARGET_COUNT)
+   if (!shaders || shader_count == 0 || target_index < 0 || target_index >= S2I_TARGET_AMD_COUNT)
       return S2I_BAD_SPIRV;
    if (!compile_traversal && (entry_index >= shader_count || shaders[entry_index].stage != S2I_STAGE_RAYGEN)) {
       if (message)
@@ -705,9 +843,32 @@ s2i_compile_rt_pipeline(const s2i_rt_shader *shaders, size_t shader_count, size_
       return S2I_BAD_SPIRV;
    }
 
+   /* Same two gates s2i_compile applies. Without them this entry point crashed on the features that
+    * spirv_to_nir cannot lower, and every shader in the pipeline has to pass, not just the entry. */
+   if (features_used &&
+       s2i_gate_extensions(features_used, s2i_amd_targets[target_index].gfx_level,
+                           s2i_amd_target_name(target_index), message))
+      return S2I_UNSUPPORTED_CAP;
+
+   for (size_t i = 0; i < shader_count; i++) {
+      if (!shaders[i].spirv || shaders[i].spirv_words < 5 || shaders[i].spirv[0] != 0x07230203u)
+         return S2I_BAD_SPIRV;
+      const char *bad = s2i_first_unsupported_ext(shaders[i].spirv, shaders[i].spirv_words,
+                                                  s2i_amd_unsupported_exts,
+                                                  ARRAY_SIZE(s2i_amd_unsupported_exts));
+      if (bad) {
+         if (message) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "unsupported SPIR-V extension for AMD/RADV: %s", bad);
+            *message = strdup(buf);
+         }
+         return S2I_UNSUPPORTED_CAP;
+      }
+   }
+
    glsl_type_singleton_init_or_ref();
 
-   const struct s2i_target_desc *t = &s2i_targets[target];
+   const struct s2i_target_desc *t = &s2i_amd_targets[target_index];
    struct radeon_info rad;
    struct radv_compiler_info ci;
    struct vk_debug_report report;
@@ -905,7 +1066,7 @@ cleanup:
 
 /*
  * Caller passes the SpvCapability values it already knows the module uses (OxC3 has them from its
- * reflection). We return the ones that need a newer AMD generation than `target` supports on RADV.
+ * reflection). We return the ones that need a newer AMD generation than `target_index` supports on RADV.
  * This is a small gen-gate table, not a full device query (that needs a VkPhysicalDevice); a
  * capability not listed here is supported across all our targets (GFX8+). OxC3's own capability
  * matrix is the authoritative higher layer; this is a convenience pre-flight.
@@ -926,12 +1087,12 @@ static const struct {
 };
 
 char *
-s2i_unsupported_caps(const uint32_t *caps_used, size_t caps_count, s2i_target target)
+s2i_amd_unsupported_caps(const uint32_t *caps_used, size_t caps_count, int target_index)
 {
-   if (!caps_used || !caps_count || target < 0 || target >= S2I_TARGET_COUNT)
+   if (!caps_used || !caps_count || target_index < 0 || target_index >= S2I_TARGET_AMD_COUNT)
       return NULL;
 
-   const enum amd_gfx_level gfx = s2i_targets[target].gfx_level;
+   const enum amd_gfx_level gfx = s2i_amd_targets[target_index].gfx_level;
 
    char buf[2048];
    size_t n = 0;

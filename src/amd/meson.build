@@ -31,6 +31,6 @@ if with_gallium_radeonsi
   subdir('lanczoslib')
 endif
 
-if with_amd_vk and get_option('spirv2isa')
+if with_amd_vk and with_spirv2isa_amd
   subdir('spirv2isa')
 endif

@@ -279,7 +279,7 @@ endif
 # device-free radv_* compile functions (radv_get_nir_options / radv_declare_shader_args /
 # radv_postprocess_nir) directly. Gated, never present in a normal build.
 if get_option('spirv2isa')
-  libradv_files += files('../spirv2isa/spirv2isa.c')
+  libradv_files += files('../spirv2isa/spirv2isa_amd.c')
 endif
 
 libvulkan_radeon = shared_library(

@@ -985,6 +985,13 @@ if with_clc
   dep_clc = dependency('libclc')
 endif
 
+# spirv2isa: which backends this build wants. It drives nir/vtn directly, so it counts as a compute
+# consumer below; without that nir builds as its headers only stub and nothing can link it.
+
+with_spirv2isa = get_option('spirv2isa')
+with_spirv2isa_amd = with_spirv2isa and get_option('spirv2isa-backends').contains('amd')
+with_spirv2isa_intel = with_spirv2isa and get_option('spirv2isa-backends').contains('intel')
+
 with_gfx_compute = [
   with_any_opengl,
   with_any_vk,

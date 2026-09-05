@@ -21,7 +21,7 @@ subdir('dev')
 subdir('isl')
 subdir('common')
 subdir('compiler')
-if get_option('spirv2isa')
+if with_spirv2isa_intel
   subdir('spirv2isa')
 endif
 if with_intel_hasvk or with_intel_vk or with_gallium_crocus or with_gallium_iris
