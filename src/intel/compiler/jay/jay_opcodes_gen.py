@@ -18,7 +18,7 @@ HEADER_TEMPLATE = """/*
 #include <stdbool.h>
 #include "util/macros.h"
 
-enum PACKED jay_opcode {
+enum ENUM_PACKED jay_opcode {
 % for opcode in opcodes:
    JAY_OPCODE_${opcode.upper()},
 % endfor

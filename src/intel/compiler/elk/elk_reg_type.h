@@ -24,7 +24,7 @@ struct intel_device_info;
  * The ordering has been chosen so that no enum value is the same as a
  * compatible hardware encoding.
  */
-enum PACKED elk_reg_type {
+enum ENUM_PACKED elk_reg_type {
    /** Floating-point types: @{ */
    ELK_REGISTER_TYPE_NF, /* >64-bit (accumulator-only) native float (gfx11+) */
    ELK_REGISTER_TYPE_DF, /* 64-bit float (double float) */

@@ -35,7 +35,7 @@ struct intel_device_info;
  * the register file (immediate or register).  We also encode the size
  * of vector immediates in a way that makes type size calculations simple.
  */
-enum PACKED brw_reg_type {
+enum ENUM_PACKED brw_reg_type {
    /* Unsigned integer types: 8, 16, 32, and 64-bit @{ */
    BRW_TYPE_UB = 0b00000,
    BRW_TYPE_UW = 0b00001,
@@ -183,7 +183,7 @@ brw_type_larger_of(enum brw_reg_type a, enum brw_reg_type b)
 /**
  * Enum for float data types.
  */
-enum PACKED brw_data_type_float {
+enum ENUM_PACKED brw_data_type_float {
    BRW_TYPE_FLOAT_BF8   = 0,
    BRW_TYPE_FLOAT_HF    = 1,
    BRW_TYPE_FLOAT_F     = 2,
@@ -196,7 +196,7 @@ enum PACKED brw_data_type_float {
 /**
  * Enum for integer data types.
  */
-enum PACKED brw_data_type_int {
+enum ENUM_PACKED brw_data_type_int {
    BRW_TYPE_INT_UB      = 0,
    BRW_TYPE_INT_UW      = 1,
    BRW_TYPE_INT_UD      = 2,

@@ -33,6 +33,7 @@
 #include "brw_shader.h"
 #include "brw_cfg.h"
 #include "util/macros.h"
+#include "util/u_memory.h"   /* align_malloc / align_free: posix_memalign is POSIX only */
 
 #ifdef __SSE2__
 
@@ -262,7 +263,7 @@ namespace {
 
       ~weight_vector_type()
       {
-         free(v);
+         align_free(v);
       }
 
       weight_vector_type &
@@ -282,8 +283,8 @@ namespace {
       {
          const unsigned align = MAX2(sizeof(void *), __alignof__(vector_type));
          const unsigned size = DIV_ROUND_UP(n, vector_width) * sizeof(vector_type);
-         void *p;
-         if (posix_memalign(&p, align, size))
+         void *p = align_malloc(size, align);
+         if (!p)
             return NULL;
          memset(p, 0, size);
          return reinterpret_cast<vector_type *>(p);

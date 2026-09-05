@@ -27,7 +27,7 @@ typedef enum ENUM_PACKED gen_file {
  * regular floating point and bfloat.
  * Bit 5 is set for vector immediates.
  */
-typedef enum PACKED gen_reg_type {
+typedef enum ENUM_PACKED gen_reg_type {
    /* Unsigned integer types: 8, 16, 32, and 64-bit. */
    GEN_TYPE_UB = 0b00000,
    GEN_TYPE_UW = 0b00001,
@@ -335,7 +335,7 @@ enum lsc_cache_load {
  * are uncached (UC), cached (C), cached-as-a-constand (CC) and
  * invalidate-after-read (IAR).
  */
-enum PACKED xe2_lsc_cache_load {
+enum ENUM_PACKED xe2_lsc_cache_load {
    /* No override. Use the non-pipelined or surface state cache settings for L1
     * and L3.
     */
@@ -395,7 +395,7 @@ enum ENUM_PACKED lsc_cache_store {
  * (WT), write-back (WB) and streaming (S). Dataport L3 cache policies are
  * uncached (UC) and cached (WB).
  */
-enum PACKED xe2_lsc_cache_store {
+enum ENUM_PACKED xe2_lsc_cache_store {
    /* No override. Use the non-pipelined or surface state cache settings for L1
     * and L3.
     */

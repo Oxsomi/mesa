@@ -15,7 +15,7 @@ PRAGMA_DIAGNOSTIC_ERROR(-Wpadded)
 
 % for enum, (prefix, values) in enums.items():
 % if enum.startswith('jay'):
-enum PACKED ${enum} {
+enum ENUM_PACKED ${enum} {
 % for v in values:
    ${prefix}_${v.upper()},
 % endfor

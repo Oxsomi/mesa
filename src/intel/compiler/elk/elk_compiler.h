@@ -147,7 +147,7 @@ struct elk_compiler {
  *  @{
  */
 
-enum PACKED elk_gfx6_gather_sampler_wa {
+enum ENUM_PACKED elk_gfx6_gather_sampler_wa {
    ELK_WA_SIGN = 1,      /* whether we need to sign extend */
    ELK_WA_8BIT = 2,      /* if we have an 8bit format needing wa */
    ELK_WA_16BIT = 4,     /* if we have a 16bit format needing wa */

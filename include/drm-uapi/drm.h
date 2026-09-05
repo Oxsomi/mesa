@@ -44,11 +44,17 @@ typedef unsigned int drm_handle_t;
 #else /* One of the BSDs or GNU */
 
 #include <stdint.h>
+#if defined(_WIN32)
+/* Windows has no ioctl header and no sys/types.h fixed-width types. Nothing that includes this for
+ * its format or structure definitions (drm_fourcc.h, isl) issues an ioctl, so the DRM_IO* macros
+ * below simply have nothing to expand from here. */
+#else
 #include <sys/types.h>
 #if defined(__GNU__)
 #include <sys/ioctl.h>
 #else
 #include <sys/ioccom.h>
+#endif
 #endif
 typedef int8_t   __s8;
 typedef uint8_t  __u8;

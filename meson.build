@@ -996,6 +996,7 @@ with_gfx_compute = [
   with_any_opengl,
   with_any_vk,
   with_clc,
+  with_spirv2isa,
   with_gallium_va and with_video_encode,
   with_gallium_mediafoundation and with_video_encode,
 ].contains(true)

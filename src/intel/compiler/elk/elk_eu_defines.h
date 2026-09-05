@@ -996,7 +996,7 @@ enum lsc_cache_load {
  * are uncached (UC), cached (C), cached-as-a-constand (CC) and
  * invalidate-after-read (IAR).
  */
-enum PACKED xe2_lsc_cache_load {
+enum ENUM_PACKED xe2_lsc_cache_load {
    /* No override. Use the non-pipelined or surface state cache settings for L1
     * and L3.
     */
@@ -1056,7 +1056,7 @@ enum ENUM_PACKED lsc_cache_store {
  * (WT), write-back (WB) and streaming (S). Dataport L3 cache policies are
  * uncached (UC) and cached (WB).
  */
-enum PACKED xe2_lsc_cache_store {
+enum ENUM_PACKED xe2_lsc_cache_store {
    /* No override. Use the non-pipelined or surface state cache settings for L1
     * and L3.
     */

@@ -33,11 +33,14 @@
 #include "intel_device_info.h"
 #include "intel_hwconfig.h"
 #include "intel_wa.h"
+/* The kernel query path (a DRM fd: i915, xe, virtio) exists only where that kernel does; the PCI
+ * id path below needs none of it. */
 #include "i915/intel_device_info.h"
+#if MESA_SYSTEM_HAS_KMS_DRM
 #include "xe/intel_device_info.h"
 #include "virtio/intel_virtio.h"
-
 #include "common/intel_gem.h"
+#endif
 #include "util/u_debug.h"
 #include "util/log.h"
 #include "util/macros.h"
@@ -1502,7 +1505,15 @@ scan_for_force_probe(int pci_id, bool *force_on, bool *force_off)
    if (len == 0)
       return;
 
+#ifdef _WIN32
+   char *dup = malloc(len + 1);
+   if (dup) {
+      memcpy(dup, env, len);
+      dup[len] = '\0';
+   }
+#else
    char *dup = strndup(env, len);
+#endif
    if (dup == NULL)
       return;
 
@@ -1892,6 +1903,8 @@ intel_device_info_update_after_hwconfig(struct intel_device_info *devinfo)
       MAX2(16, devinfo->urb.min_entries[MESA_SHADER_GEOMETRY]);
 }
 
+#if MESA_SYSTEM_HAS_KMS_DRM
+/* Reading a device out of a DRM fd needs that kernel; the PCI id path above does not */
 bool
 intel_get_device_info_from_fd(int fd, struct intel_device_info *devinfo, int min_ver, int max_ver)
 {
@@ -2016,7 +2029,9 @@ intel_get_device_info_from_fd(int fd, struct intel_device_info *devinfo, int min
 
    return true;
 }
+#endif /* MESA_SYSTEM_HAS_KMS_DRM */
 
+#if MESA_SYSTEM_HAS_KMS_DRM
 bool intel_device_info_update_memory_info(struct intel_device_info *devinfo, int fd)
 {
    bool ret;
@@ -2036,6 +2051,7 @@ bool intel_device_info_update_memory_info(struct intel_device_info *devinfo, int
       intel_device_info_adjust_memory(devinfo);
    return ret;
 }
+#endif /* MESA_SYSTEM_HAS_KMS_DRM */
 
 enum intel_wa_steppings
 intel_device_info_wa_stepping(struct intel_device_info *devinfo)

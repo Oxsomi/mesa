@@ -27,8 +27,10 @@
 #include "intel/dev/intel_device_info.h"
 
 #include "intel/dev/intel_hwconfig.h"
+#if MESA_SYSTEM_HAS_KMS_DRM
 #include "intel/common/intel_gem.h"
 #include "intel/common/i915/intel_gem.h"
+#endif
 
 #include "util/bitscan.h"
 #include "util/log.h"
@@ -225,6 +227,10 @@ intel_device_info_i915_update_from_masks(struct intel_device_info *devinfo, uint
 
    return true;
 }
+
+#if MESA_SYSTEM_HAS_KMS_DRM
+/* The kernel query path: everything below reads a device through ioctls on a DRM fd. The device-free
+ * half above (the topology and mask maths intel_get_device_info_from_pci_id calls) needs no kernel. */
 
 static bool
 getparam(int fd, uint32_t param, int *value)
@@ -642,3 +648,4 @@ bool intel_device_info_i915_get_info_from_fd(int fd, struct intel_device_info *d
 
    return true;
 }
+#endif /* MESA_SYSTEM_HAS_KMS_DRM */

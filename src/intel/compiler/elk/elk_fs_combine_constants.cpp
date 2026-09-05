@@ -27,7 +27,7 @@ static const bool debug = false;
 
 namespace {
 
-enum PACKED interpreted_type {
+enum ENUM_PACKED interpreted_type {
    float_only = 0,
    integer_only,
    either_type

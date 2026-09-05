@@ -17,7 +17,7 @@
 #include "util/u_math.h"
 #include "jay_opcodes.h"
 
-enum PACKED jay_file {
+enum ENUM_PACKED jay_file {
    /** Bit 0 of each file indicates whether it is uniform or not */
    JAY_UNIFORM = 0x1,
 
@@ -435,7 +435,7 @@ jay_is_zero(jay_def src)
 /* Chosen so that sized type is the unsized type OR the number bits */
 #define JAY_TYPE_BASE_MASK (128 | 2 | 4)
 
-enum PACKED jay_type {
+enum ENUM_PACKED jay_type {
    JAY_TYPE_UNTYPED = 0,
    JAY_TYPE_U = 2,
    JAY_TYPE_S = 4,
@@ -724,7 +724,7 @@ jay_src_type(const jay_inst *I, unsigned s)
    return I->type;
 }
 
-enum PACKED jay_stride {
+enum ENUM_PACKED jay_stride {
    JAY_STRIDE_2 = 0,
    JAY_STRIDE_4,
    JAY_STRIDE_8,

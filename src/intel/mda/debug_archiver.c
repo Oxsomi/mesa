@@ -15,7 +15,13 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
+#ifdef _WIN32
+#include <direct.h>
+#include <process.h>
+#define getpid _getpid
+#else
 #include <unistd.h>
+#endif
 
 struct debug_archiver
 {
@@ -40,7 +46,11 @@ ensure_output_dir(const char *dir)
    if (stat(dir, &st) == 0)
       return S_ISDIR(st.st_mode);
 
+#ifdef _WIN32
+   return _mkdir(dir) == 0;
+#else
    return mkdir(dir, 0755) == 0;
+#endif
 }
 
 static bool

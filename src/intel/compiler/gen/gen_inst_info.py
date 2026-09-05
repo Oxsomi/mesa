@@ -6,7 +6,6 @@ import argparse
 import copy
 import ctypes
 import enum
-import fcntl
 import json
 import pathlib
 import os
