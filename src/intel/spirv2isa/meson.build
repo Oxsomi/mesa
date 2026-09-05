@@ -13,6 +13,7 @@
 #   src/intel/meson.build    : if with_spirv2isa_intel / subdir('spirv2isa') / endif  (after 'compiler')
 
 spirv2isa_intel_deps = [
+  idep_anv_nir_lowering,     # ANV's own descriptor / driver-value / multiview lowering, linked not copied
   idep_intel_compiler_brw,   # brw_compile / brw_compiler_create (+ isl, nir, vtn, mesautil, gen)
   idep_intel_dev,            # intel_get_device_info_from_pci_id
   idep_nir,
@@ -29,7 +30,7 @@ spirv2isa_intel_incs = [
 
 libspirv2isa_intel = static_library(
   'spirv2isa_intel',
-  files('spirv2isa_intel.c'),
+  files('spirv2isa_intel.c', 'spirv2isa_intel_anv.c'),
   include_directories : spirv2isa_intel_incs,
   dependencies : spirv2isa_intel_deps,
   build_by_default : false,

@@ -120,6 +120,65 @@ idep_anv_drirc = declare_dependency(
   link_with : libanv_drirc,
 )
 
+# spirv2isa compiles shaders with no device, and reuses ANV's NIR lowering to do it rather than
+# maintaining a second copy of rules that would drift. It needs the generated headers above and the
+# passes below; it needs none of the driver, so a build without the driver stops here.
+if not with_intel_vk
+  anv_nir_lowering_incs = [
+    inc_anv, inc_include, inc_src, inc_intel, inc_intel_compiler,
+    include_directories('../genxml'),
+    include_directories('../compiler/brw'),
+    include_directories('../compiler/gen'),
+    include_directories('../../vulkan/runtime'),
+    include_directories('../../vulkan/util'),
+    include_directories('../../vulkan/wsi'),
+  ]
+
+  # The Intel device headers reach for POSIX headers to talk to a kernel driver this never opens.
+  if host_machine.system() == 'windows'
+    anv_nir_lowering_incs += include_directories('../spirv2isa/win_shim')
+  endif
+
+  libanv_nir_lowering = static_library(
+    'anv_nir_lowering',
+    files(
+      # compiled a second time, layout arithmetic only, the way genX_*.c is compiled per
+      # generation: no fork of the rules, and no driver linked with them
+      'anv_descriptor_set.c',
+      'anv_nir_apply_pipeline_layout.c',
+      'anv_nir_compute_push_layout.c',
+      'anv_nir_lower_driver_values.c',
+      'anv_nir_lower_multiview.c',
+      'anv_nir_lower_resource_intel.c',
+      'anv_nir_lower_ubo_loads.c',
+      'anv_nir_push_constants_analysis.c',
+      # the one function the lowering needs out of the Vulkan util library, which a
+      # build without a driver does not otherwise link
+      '../../vulkan/util/vk_format.c',
+    ),
+    include_directories : anv_nir_lowering_incs,
+    c_args : anv_flags + ['-DANV_DESCRIPTOR_SET_LAYOUT_ONLY'],
+    dependencies : [
+      idep_anv_headers, idep_anv_drirc, idep_vulkan_util_headers,
+      idep_vulkan_generated_headers, idep_genxml, idep_nir_headers,
+      idep_mesautil, idep_intel_dev,
+    ],
+    build_by_default : false,
+  )
+
+  idep_anv_nir_lowering = declare_dependency(
+    link_with : libanv_nir_lowering,
+    include_directories : anv_nir_lowering_incs,
+    dependencies : [
+      idep_anv_headers, idep_anv_drirc, idep_vulkan_util_headers,
+      idep_vulkan_generated_headers, idep_genxml,
+    ],
+  )
+
+  subdir_done()
+endif
+
+
 libanv_per_hw_ver_libs = []
 anv_per_hw_ver_files = files(
   'genX_blorp_exec.c',

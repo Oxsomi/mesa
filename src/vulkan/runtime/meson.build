@@ -170,6 +170,17 @@ vk_format_info = custom_target(
   ],
 )
 
+# The generated headers above are all a device-free consumer needs from here: spirv2isa compiles
+# ANV's NIR lowering, which includes the runtime headers but links nothing out of the runtime.
+idep_vulkan_generated_headers = declare_dependency(
+  sources : [vk_cmd_queue[1], vk_physical_device_features[1], vk_physical_device_properties[1]],
+  include_directories : include_directories('.'),
+)
+
+if not (with_any_vk or with_gallium_zink)
+  subdir_done()
+endif
+
 vulkan_lite_runtime_files += [
   vk_cmd_enqueue_entrypoints,
   vk_cmd_queue,

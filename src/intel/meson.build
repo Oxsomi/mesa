@@ -21,9 +21,6 @@ subdir('dev')
 subdir('isl')
 subdir('common')
 subdir('compiler')
-if with_spirv2isa_intel
-  subdir('spirv2isa')
-endif
 if with_intel_hasvk or with_intel_vk or with_gallium_crocus or with_gallium_iris
   subdir('blorp')
 endif
@@ -44,8 +41,11 @@ endif
 if get_option('vulkan-layers').contains('intel-nullhw')
   subdir('nullhw-layer')
 endif
-if with_intel_vk
+if with_intel_vk or with_spirv2isa_intel
   subdir('vulkan')
+endif
+if with_spirv2isa_intel
+  subdir('spirv2isa')
 endif
 if with_intel_hasvk
   subdir('vulkan_hasvk')

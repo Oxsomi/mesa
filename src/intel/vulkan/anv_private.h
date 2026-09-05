@@ -3748,6 +3748,23 @@ bool anv_descriptor_requires_bindless(const struct anv_physical_device *pdevice,
 
 void anv_descriptor_set_layout_print(const struct anv_descriptor_set_layout *layout);
 
+/* The layout arithmetic in anv_descriptor_set.c, which needs no device and is therefore also built
+ * standalone (ANV_DESCRIPTOR_SET_LAYOUT_ONLY) for offline shader compilation. */
+
+void
+anv_descriptor_set_layout_count(const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
+                                uint32_t *num_bindings_out,
+                                uint32_t *immutable_sampler_count_out);
+
+void
+anv_descriptor_set_layout_init(const struct anv_physical_device *pdevice,
+                               const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
+                               struct anv_descriptor_set_layout *set_layout,
+                               struct anv_descriptor_set_binding_layout *bindings,
+                               struct anv_descriptor_set_layout_sampler *samplers,
+                               uint32_t num_bindings,
+                               uint32_t immutable_sampler_count);
+
 struct anv_descriptor {
    VkDescriptorType type;
 
@@ -6000,12 +6017,17 @@ anv_image_is_sparse(const struct anv_image *image)
    return image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT;
 }
 
+/* Guarded to match the condition vk_image.h declares drm_format_mod under: where the field does not
+ * exist, neither does the question, and a caller that appears anyway should fail to build rather than
+ * receive an answer nothing has tested. */
+#if DETECT_OS_LINUX || DETECT_OS_BSD
 static inline bool
 anv_image_is_externally_shared(const struct anv_image *image)
 {
    return image->vk.drm_format_mod != DRM_FORMAT_MOD_INVALID ||
           image->vk.external_handle_types != 0;
 }
+#endif
 
 static inline bool
 anv_image_has_private_binding(const struct anv_image *image)

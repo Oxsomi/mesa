@@ -180,7 +180,9 @@ typedef enum s2i_stage {
  * reflection). Each backend builds the descriptor set layouts its SPIR-V descriptor lowering needs
  * from these, instead of guessing a generic layout. The type drives how the descriptor is lowered (a
  * buffer, an image, a sampler, an acceleration structure...); the set/binding place it so the
- * SPIR-V's DescriptorSet/Binding decorations resolve. Mirrors VkDescriptorType 1:1.
+ * SPIR-V's DescriptorSet/Binding decorations resolve.
+ * The members are dense so a backend can index a table with them, which VkDescriptorType is not: its
+ * last two members are extension values in the billions. A backend translates, and must never cast.
  */
 typedef enum s2i_descriptor_type {
    S2I_DESC_SAMPLER = 0,
@@ -258,12 +260,6 @@ typedef struct s2i_info {
                                 * intersection always, miss/closest-hit unless they recurse (traceRay),
                                 * callable never. 0 otherwise / not an RT shader. */
    uint8_t graphics_specialized; /* 1 if a graphics PSO state was applied (baked-in), 0 = unlinked/dynamic */
-   uint8_t descriptors_stateless; /* 1 if buffer descriptors were lowered to raw addresses instead of the
-                                   * driver's own descriptor access. The instructions are real, but the
-                                   * memory messages and the register pressure they cost are NOT what a
-                                   * driver would emit, so a caller comparing against hardware has to
-                                   * know. 0 when the shader touches no buffers, or once a backend
-                                   * lowers them the way its driver does. */
 } s2i_info;
 
 typedef enum s2i_result {

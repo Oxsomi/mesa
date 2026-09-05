@@ -14,6 +14,8 @@
  */
 
 #include "spirv2isa_amd.h"
+#include "spirv2isa_desc.h"
+#include "spirv2isa_stage.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -75,24 +77,6 @@ s2i_amd_target_name(int target_index)
    return s2i_amd_targets[target_index].name;
 }
 
-/* --- stage mapping (caller's s2i_stage -> Mesa mesa_shader_stage; we never derive it) ------- */
-
-static const mesa_shader_stage s2i_mesa_stage[S2I_STAGE_COUNT] = {
-   [S2I_STAGE_VERTEX]       = MESA_SHADER_VERTEX,
-   [S2I_STAGE_PIXEL]        = MESA_SHADER_FRAGMENT,
-   [S2I_STAGE_COMPUTE]      = MESA_SHADER_COMPUTE,
-   [S2I_STAGE_HULL]         = MESA_SHADER_TESS_CTRL,
-   [S2I_STAGE_DOMAIN]       = MESA_SHADER_TESS_EVAL,
-   [S2I_STAGE_GEOMETRY]     = MESA_SHADER_GEOMETRY,
-   [S2I_STAGE_TASK]         = MESA_SHADER_TASK,
-   [S2I_STAGE_MESH]         = MESA_SHADER_MESH,
-   [S2I_STAGE_RAYGEN]       = MESA_SHADER_RAYGEN,
-   [S2I_STAGE_CALLABLE]     = MESA_SHADER_CALLABLE,
-   [S2I_STAGE_MISS]         = MESA_SHADER_MISS,
-   [S2I_STAGE_CLOSEST_HIT]  = MESA_SHADER_CLOSEST_HIT,
-   [S2I_STAGE_ANY_HIT]      = MESA_SHADER_ANY_HIT,
-   [S2I_STAGE_INTERSECTION] = MESA_SHADER_INTERSECTION,
-};
 
 enum s2i_stage_class { S2I_CLASS_COMPUTE, S2I_CLASS_GRAPHICS, S2I_CLASS_RT };
 
@@ -116,25 +100,22 @@ s2i_class_of(s2i_stage stage)
 
 /* --- descriptor layout (built from the caller's bindings; RADV indexes binding[binding_number]) - */
 
-struct s2i_desc_info {
-   VkDescriptorType vk;
-   uint32_t size;   /* per-element descriptor size, mirroring RADV's own sizing */
-};
-
-static const struct s2i_desc_info s2i_desc[S2I_DESC_TYPE_COUNT] = {
-   [S2I_DESC_SAMPLER]                = { VK_DESCRIPTOR_TYPE_SAMPLER,                RADV_SAMPLER_DESC_SIZE },
-   [S2I_DESC_COMBINED_IMAGE_SAMPLER] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, RADV_STORAGE_IMAGE_DESC_SIZE + RADV_SAMPLER_DESC_SIZE },
-   [S2I_DESC_SAMPLED_IMAGE]          = { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,          RADV_STORAGE_IMAGE_DESC_SIZE },
-   [S2I_DESC_STORAGE_IMAGE]          = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          RADV_STORAGE_IMAGE_DESC_SIZE },
-   [S2I_DESC_UNIFORM_TEXEL_BUFFER]   = { VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,   RADV_BUFFER_DESC_SIZE },
-   [S2I_DESC_STORAGE_TEXEL_BUFFER]   = { VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,   RADV_BUFFER_DESC_SIZE },
-   [S2I_DESC_UNIFORM_BUFFER]         = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         RADV_BUFFER_DESC_SIZE },
-   [S2I_DESC_STORAGE_BUFFER]         = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         RADV_BUFFER_DESC_SIZE },
-   [S2I_DESC_UNIFORM_BUFFER_DYNAMIC] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, RADV_BUFFER_DESC_SIZE },
-   [S2I_DESC_STORAGE_BUFFER_DYNAMIC] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, RADV_BUFFER_DESC_SIZE },
-   [S2I_DESC_INPUT_ATTACHMENT]       = { VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,       RADV_STORAGE_IMAGE_DESC_SIZE },
-   [S2I_DESC_INLINE_UNIFORM_BLOCK]   = { VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK,   RADV_BUFFER_DESC_SIZE },
-   [S2I_DESC_ACCELERATION_STRUCTURE] = { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, RADV_ACCEL_STRUCT_DESC_SIZE },
+/* Per-element descriptor size, mirroring RADV's own sizing. Which VkDescriptorType a member
+ * means is not RADV's business and is shared with the other backends (spirv2isa_desc.h). */
+static const uint32_t s2i_desc_size[S2I_DESC_TYPE_COUNT] = {
+   [S2I_DESC_SAMPLER               ] = RADV_SAMPLER_DESC_SIZE,
+   [S2I_DESC_COMBINED_IMAGE_SAMPLER] = RADV_STORAGE_IMAGE_DESC_SIZE + RADV_SAMPLER_DESC_SIZE,
+   [S2I_DESC_SAMPLED_IMAGE         ] = RADV_STORAGE_IMAGE_DESC_SIZE,
+   [S2I_DESC_STORAGE_IMAGE         ] = RADV_STORAGE_IMAGE_DESC_SIZE,
+   [S2I_DESC_UNIFORM_TEXEL_BUFFER  ] = RADV_BUFFER_DESC_SIZE,
+   [S2I_DESC_STORAGE_TEXEL_BUFFER  ] = RADV_BUFFER_DESC_SIZE,
+   [S2I_DESC_UNIFORM_BUFFER        ] = RADV_BUFFER_DESC_SIZE,
+   [S2I_DESC_STORAGE_BUFFER        ] = RADV_BUFFER_DESC_SIZE,
+   [S2I_DESC_UNIFORM_BUFFER_DYNAMIC] = RADV_BUFFER_DESC_SIZE,
+   [S2I_DESC_STORAGE_BUFFER_DYNAMIC] = RADV_BUFFER_DESC_SIZE,
+   [S2I_DESC_INPUT_ATTACHMENT      ] = RADV_STORAGE_IMAGE_DESC_SIZE,
+   [S2I_DESC_INLINE_UNIFORM_BLOCK  ] = RADV_BUFFER_DESC_SIZE,
+   [S2I_DESC_ACCELERATION_STRUCTURE] = RADV_ACCEL_STRUCT_DESC_SIZE,
 };
 
 /* Every descriptor set layout we allocate for one compile, so we can free them all afterwards. */
@@ -200,8 +181,8 @@ s2i_build_fed_layout(const s2i_binding *bindings, size_t n, struct radv_shader_l
 
          if (fb) {
             uint32_t arr = fb->count ? fb->count : 1;
-            uint32_t sz = s2i_desc[fb->type].size;
-            dsl->binding[b].type = s2i_desc[fb->type].vk;
+            uint32_t sz = s2i_desc_size[fb->type];
+            dsl->binding[b].type = s2i_descriptor_type_to_vk(fb->type);
             dsl->binding[b].array_size = arr;
             dsl->binding[b].offset = offset;
             dsl->binding[b].size = sz;
@@ -615,7 +596,7 @@ s2i_amd_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2
    /* Mesh and task are NGG-only stages that do not exist before GFX10.3. Enabling key.use_ngg for them
     * (needed so radv_get_user_data_0 accepts a mesh stage) walks an older target straight into ACO's NGG
     * path and crashes, so reject here rather than compile something the target cannot express. */
-   if ((s2i_mesa_stage[stage] == MESA_SHADER_MESH || s2i_mesa_stage[stage] == MESA_SHADER_TASK) &&
+   if ((s2i_stage_to_mesa(stage) == MESA_SHADER_MESH || s2i_stage_to_mesa(stage) == MESA_SHADER_TASK) &&
        s2i_amd_targets[target_index].gfx_level < GFX10_3) {
       if (message) {
          char buf[160];
@@ -653,7 +634,7 @@ s2i_amd_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2
    }
 
    struct radv_shader_binary *bin = NULL;
-   const mesa_shader_stage ms = s2i_mesa_stage[stage];
+   const mesa_shader_stage ms = s2i_stage_to_mesa(stage);
 
    if (cls == S2I_CLASS_COMPUTE) {
       struct radv_shader_stage cs;
@@ -910,7 +891,7 @@ s2i_amd_compile_rt_pipeline(const s2i_rt_shader *shaders, size_t shader_count, s
     * build the groups. Each shader becomes one group (general for raygen/miss/callable, a hit group
     * for hit shaders); distinct synthetic handle pointers let the monolithic inliner switch on them. */
    for (size_t i = 0; i < shader_count; i++) {
-      const mesa_shader_stage ms = s2i_mesa_stage[shaders[i].stage];
+      const mesa_shader_stage ms = s2i_stage_to_mesa(shaders[i].stage);
       nir_shader *nir = s2i_rt_shader_to_nir(&ci, &layout, ms, shaders[i].spirv, shaders[i].spirv_words,
                                              shaders[i].entry, &payload_size, &hit_attrib_size);
       if (!nir) {

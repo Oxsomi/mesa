@@ -83,8 +83,14 @@ idep_vulkan_wsi_defines = declare_dependency(
 )
 vulkan_wsi_deps += idep_vulkan_wsi_defines
 
+# util holds the generated headers (vk_dispatch_table, vk_extensions, the enum and feature tables),
+# which spirv2isa needs to compile ANV's NIR lowering. Everything below it belongs to a driver, so a
+# spirv2isa-only build stops here.
 subdir('util')
 subdir('runtime')
+if not (with_any_vk or with_gallium_zink)
+  subdir_done()
+endif
 subdir('wsi')
 if with_vulkan_overlay_layer
   subdir('overlay-layer')

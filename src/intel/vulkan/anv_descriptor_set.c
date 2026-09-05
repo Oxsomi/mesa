@@ -24,14 +24,11 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
 
 #include "util/mesa-blake3.h"
 #include "vk_util.h"
 
 #include "anv_private.h"
-
 /*
  * Descriptor set layouts.
  */
@@ -689,16 +686,14 @@ blake3_hash_descriptor_set_layout(struct anv_descriptor_set_layout *layout)
    _mesa_blake3_final(&ctx, layout->vk.blake3);
 }
 
-VkResult anv_CreateDescriptorSetLayout(
-    VkDevice                                    _device,
-    const VkDescriptorSetLayoutCreateInfo*      pCreateInfo,
-    const VkAllocationCallbacks*                pAllocator,
-    VkDescriptorSetLayout*                      pSetLayout)
+
+/* Sizes a layout allocation: the highest binding number used, and how many immutable samplers the
+ * bindings carry. A caller with no device needs both before it can allocate anything. */
+void
+anv_descriptor_set_layout_count(const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
+                                uint32_t *num_bindings_out,
+                                uint32_t *immutable_sampler_count_out)
 {
-   ANV_FROM_HANDLE(anv_device, device, _device);
-
-   assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO);
-
    uint32_t num_bindings = 0;
    uint32_t immutable_sampler_count = 0;
    for (uint32_t j = 0; j < pCreateInfo->bindingCount; j++) {
@@ -722,22 +717,23 @@ VkResult anv_CreateDescriptorSetLayout(
          immutable_sampler_count += pCreateInfo->pBindings[j].descriptorCount;
    }
 
-   /* We need to allocate descriptor set layouts off the device allocator
-    * with DEVICE scope because they are reference counted and may not be
-    * destroyed when vkDestroyDescriptorSetLayout is called.
-    */
-   VK_MULTIALLOC(ma);
-   VK_MULTIALLOC_DECL(&ma, struct anv_descriptor_set_layout, set_layout, 1);
-   VK_MULTIALLOC_DECL(&ma, struct anv_descriptor_set_binding_layout,
-                           bindings, num_bindings);
-   VK_MULTIALLOC_DECL(&ma, struct anv_descriptor_set_layout_sampler, samplers,
-                           immutable_sampler_count);
+   *num_bindings_out = num_bindings;
+   *immutable_sampler_count_out = immutable_sampler_count;
+}
 
-   if (!vk_descriptor_set_layout_multizalloc(&device->vk, &ma, pCreateInfo))
-      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
-
+/* Fills an already-allocated layout. set_layout, bindings and samplers must be zeroed and sized from
+ * anv_descriptor_set_layout_count; nothing here allocates, and nothing here can fail. */
+void
+anv_descriptor_set_layout_init(const struct anv_physical_device *pdevice,
+                               const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
+                               struct anv_descriptor_set_layout *set_layout,
+                               struct anv_descriptor_set_binding_layout *bindings,
+                               struct anv_descriptor_set_layout_sampler *samplers,
+                               uint32_t num_bindings,
+                               uint32_t immutable_sampler_count)
+{
    set_layout->binding_count = num_bindings;
-   set_layout->type = anv_descriptor_set_layout_type_for_flags(device->physical,
+   set_layout->type = anv_descriptor_set_layout_type_for_flags(pdevice,
                                                                pCreateInfo);
 
    for (uint32_t b = 0; b < num_bindings; b++) {
@@ -829,11 +825,11 @@ VkResult anv_CreateDescriptorSetLayout(
 
       set_layout->binding[b].data =
          binding->descriptorType == VK_DESCRIPTOR_TYPE_MUTABLE_EXT ?
-         anv_descriptor_data_for_mutable_type(device->physical,
+         anv_descriptor_data_for_mutable_type(pdevice,
                                               set_layout->type,
                                               pCreateInfo->flags,
                                               mutable_info, b) :
-         anv_descriptor_data_for_type(device->physical,
+         anv_descriptor_data_for_type(pdevice,
                                       set_layout->type,
                                       pCreateInfo->flags,
                                       binding->descriptorType);
@@ -900,7 +896,7 @@ VkResult anv_CreateDescriptorSetLayout(
       uint16_t descriptor_data_sampler_size;
       if (binding->descriptorType == VK_DESCRIPTOR_TYPE_MUTABLE_EXT) {
          anv_descriptor_size_for_mutable_type(
-            device->physical, set_layout->type,
+            pdevice, set_layout->type,
             pCreateInfo->flags, mutable_info, b,
             &set_layout->binding[b].descriptor_data_surface_size,
             &descriptor_data_sampler_size);
@@ -970,6 +966,46 @@ VkResult anv_CreateDescriptorSetLayout(
    }
 
    blake3_hash_descriptor_set_layout(set_layout);
+}
+
+/*
+ * Everything above this point is a pure function of a VkDescriptorSetLayoutCreateInfo and an
+ * anv_physical_device: no device, no allocator, no driver. Compiling this file with
+ * ANV_DESCRIPTOR_SET_LAYOUT_ONLY stops here, which is how an offline shader compiler reaches the
+ * layout arithmetic without linking the driver, and why the two cannot drift apart.
+ * Below is the Vulkan entrypoint that allocates a layout, and the descriptor pool and set code.
+ */
+#ifndef ANV_DESCRIPTOR_SET_LAYOUT_ONLY
+
+VkResult anv_CreateDescriptorSetLayout(
+    VkDevice                                    _device,
+    const VkDescriptorSetLayoutCreateInfo*      pCreateInfo,
+    const VkAllocationCallbacks*                pAllocator,
+    VkDescriptorSetLayout*                      pSetLayout)
+{
+   ANV_FROM_HANDLE(anv_device, device, _device);
+
+   assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO);
+
+   uint32_t num_bindings, immutable_sampler_count;
+   anv_descriptor_set_layout_count(pCreateInfo, &num_bindings, &immutable_sampler_count);
+
+   /* We need to allocate descriptor set layouts off the device allocator
+    * with DEVICE scope because they are reference counted and may not be
+    * destroyed when vkDestroyDescriptorSetLayout is called.
+    */
+   VK_MULTIALLOC(ma);
+   VK_MULTIALLOC_DECL(&ma, struct anv_descriptor_set_layout, set_layout, 1);
+   VK_MULTIALLOC_DECL(&ma, struct anv_descriptor_set_binding_layout,
+                           bindings, num_bindings);
+   VK_MULTIALLOC_DECL(&ma, struct anv_descriptor_set_layout_sampler, samplers,
+                           immutable_sampler_count);
+
+   if (!vk_descriptor_set_layout_multizalloc(&device->vk, &ma, pCreateInfo))
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   anv_descriptor_set_layout_init(device->physical, pCreateInfo, set_layout, bindings, samplers,
+                                  num_bindings, immutable_sampler_count);
 
    *pSetLayout = anv_descriptor_set_layout_to_handle(set_layout);
 
@@ -3168,3 +3204,5 @@ VkResult anv_WriteResourceDescriptorsEXT(
 
    return VK_SUCCESS;
 }
+
+#endif /* ANV_DESCRIPTOR_SET_LAYOUT_ONLY */

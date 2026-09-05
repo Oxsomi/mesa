@@ -9,9 +9,9 @@
  * Intel's compiler is a pure function of an intel_device_info (built from the target's PCI id,
  * device-free) plus NIR: brw_compiler_create(devinfo) then brw_compile().
  *
- * This is the first slice: compute. Buffers, images and samplers are placed from the module's own
- * set/binding decorations; anything resource shaped that no pass here claims is refused by name
- * rather than reaching brw. Graphics and RT stages follow, mirroring the AMD backend.
+ * Descriptors are not lowered here: this links ANV's own passes and supplies the layout they read,
+ * so the binding tables and bindless handles are the ones the driver would build rather than a second
+ * implementation of the same rules. Anything that still reaches brw unlowered is refused by name.
  */
 #ifndef SPIRV2ISA_INTEL_H
 #define SPIRV2ISA_INTEL_H
@@ -23,8 +23,8 @@ extern "C" {
 #endif
 
 /* s2i_compile for an Intel target, taking Intel's own stats. See s2i_compile for the arguments.
- * `bindings` is validated, not consumed: placement comes from the module's own decorations, so a
- * binding this backend cannot flatten is S2I_UNSUPPORTED_CAP instead of ISA that cannot bind. */
+ * `bindings` is the layout every resource is placed from, so a module that uses a descriptor the
+ * caller did not describe cannot be compiled. */
 s2i_result s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2i_stage stage,
                              int target_index, const s2i_binding *bindings, size_t binding_count,
                              s2i_features features_used, char **isa_text, s2i_stats_intel *stats,

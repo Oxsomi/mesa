@@ -278,8 +278,12 @@ endif
 # OxC3: fold the standalone SPIR-V->ISA glue into RADV's own compilation so it can call the internal,
 # device-free radv_* compile functions (radv_get_nir_options / radv_declare_shader_args /
 # radv_postprocess_nir) directly. Gated, never present in a normal build.
+radv_spirv2isa_incs = []
 if get_option('spirv2isa')
   libradv_files += files('../spirv2isa/spirv2isa_amd.c')
+  # it is compiled here, so it needs the public spirv2isa headers here; the dependency the backend
+  # declares is for whoever links it, and does not reach this compile
+  radv_spirv2isa_incs += include_directories('../../spirv2isa')
 endif
 
 libvulkan_radeon = shared_library(
@@ -289,7 +293,7 @@ libvulkan_radeon = shared_library(
   include_directories : [
     inc_include, inc_src, inc_amd, inc_amd_common, inc_amd_common_llvm,
     inc_util, inc_virtio_gpu
-  ],
+  ] + radv_spirv2isa_incs,
   link_with : [
     libamd_common, libamd_common_llvm, libamdgpu_addrlib,
   ],

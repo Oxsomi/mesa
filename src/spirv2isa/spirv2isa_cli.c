@@ -423,10 +423,6 @@ main(int argc, char **argv)
       printf("%s\n", isa ? isa : "(no isa)");
       print_stats(stderr, &stats);
 
-      if (info.descriptors_stateless)
-         fprintf(stderr, "NOTE: buffer descriptors were lowered to raw addresses; memory messages and "
-                         "register pressure are not what a driver would emit\n");
-
       if (info.rt_mode != S2I_RT_MODE_NA) {
 
          const char *mode = info.rt_mode == S2I_RT_MODE_MONOLITHIC ? "monolithic"
