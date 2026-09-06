@@ -43,14 +43,16 @@ typedef struct s2i_intel_anv_layouts {
  * Two of the values are policy rather than fact offline; see the implementation. */
 void s2i_intel_anv_init_physical_device(struct anv_physical_device *pdev,
                                         const struct intel_device_info *devinfo,
-                                        struct brw_compiler *compiler);
+                                        struct brw_compiler *compiler,
+                                        void *mem_ctx);
 
 /* Builds one anv_descriptor_set_layout per set touched by `bindings`, using ANV's own layout
- * arithmetic. Returns false and fills `message` when a binding cannot be expressed.
- * Every set from 0 to the highest one used gets a layout, because the passes index by set number.
+ * arithmetic. Returns false and fills `message` when a layout cannot be built offline.
+ * Every set gets a layout, including the empty ones, because the passes index by set number.
  * Free with s2i_intel_anv_free_layouts. */
 bool s2i_intel_anv_build_layouts(const struct anv_physical_device *pdev,
-                                 const s2i_binding *bindings, size_t binding_count,
+                                 const VkDescriptorSetLayoutCreateInfo *const *set_layouts,
+                                 uint32_t set_layout_count,
                                  s2i_intel_anv_layouts *out, char **message);
 
 void s2i_intel_anv_free_layouts(s2i_intel_anv_layouts *layouts);

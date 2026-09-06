@@ -1275,7 +1275,7 @@ cleanup_nir(nir_shader *nir)
    } while (progress);
 }
 
-static void
+void
 anv_shader_lower_nir(struct anv_device *device,
                      void *mem_ctx,
                      const struct vk_graphics_pipeline_state *state,
@@ -1469,13 +1469,18 @@ anv_shader_lower_nir(struct anv_device *device,
       }
    }
 
-   /* Apply the actual layout to UBOs, SSBOs, and textures */
+   /* Apply the actual layout to UBOs, SSBOs, and textures. The descriptor heap path writes real
+    * per-generation sampler state through the device, which a lowering-only build has none of, so it
+    * is compiled out there rather than pulling genX in behind it. */
+#ifndef ANV_SHADER_LOWER_NIR_ONLY
    if (shader_data->info->flags & VK_SHADER_CREATE_DESCRIPTOR_HEAP_BIT_EXT) {
       NIR_PASS(_, nir, anv_nir_lower_descriptor_heap, device,
                shader_data->info->embedded_sampler_count,
                shader_data->info->embedded_samplers,
                &shader_data->bind_map);
-   } else {
+   } else
+#endif
+   {
       NIR_PASS(_, nir, anv_nir_apply_pipeline_layout,
                pdevice, shader_data->key.base.robust_flags,
                set_layouts, set_layout_count,
@@ -1639,6 +1644,15 @@ anv_shader_lower_nir(struct anv_device *device,
    if (nir->info.stage == MESA_SHADER_COMPUTE)
       shader_data->bind_map.inferred_behavior = anv_nir_clear_shader_analysis(nir);
 }
+
+/*
+ * Everything above is a pure function of an anv_physical_device and a shader: no device, no cache, no
+ * pipeline. Compiling this file with ANV_SHADER_LOWER_NIR_ONLY stops here, so an offline compiler can
+ * run anv_shader_lower_nir, ANV's real lowering in ANV's real order, instead of keeping a copy of that
+ * order which a rebase could silently reorder underneath it.
+ * Below is the driver's own orchestration: the shader cache, the pipeline entrypoints and the archiver.
+ */
+#ifndef ANV_SHADER_LOWER_NIR_ONLY
 
 static uint32_t
 sets_layout_embedded_sampler_count(const struct vk_shader_compile_info *info)
@@ -2432,3 +2446,5 @@ struct vk_device_shader_ops anv_device_shader_ops = {
    .cmd_set_rt_state               = anv_cmd_buffer_set_rt_state,
    .cmd_set_stack_size             = anv_cmd_buffer_set_stack_size,
 };
+
+#endif /* ANV_SHADER_LOWER_NIR_ONLY */

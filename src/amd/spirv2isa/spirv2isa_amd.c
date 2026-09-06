@@ -100,23 +100,29 @@ s2i_class_of(s2i_stage stage)
 
 /* --- descriptor layout (built from the caller's bindings; RADV indexes binding[binding_number]) - */
 
-/* Per-element descriptor size, mirroring RADV's own sizing. Which VkDescriptorType a member
- * means is not RADV's business and is shared with the other backends (spirv2isa_desc.h). */
-static const uint32_t s2i_desc_size[S2I_DESC_TYPE_COUNT] = {
-   [S2I_DESC_SAMPLER               ] = RADV_SAMPLER_DESC_SIZE,
-   [S2I_DESC_COMBINED_IMAGE_SAMPLER] = RADV_STORAGE_IMAGE_DESC_SIZE + RADV_SAMPLER_DESC_SIZE,
-   [S2I_DESC_SAMPLED_IMAGE         ] = RADV_STORAGE_IMAGE_DESC_SIZE,
-   [S2I_DESC_STORAGE_IMAGE         ] = RADV_STORAGE_IMAGE_DESC_SIZE,
-   [S2I_DESC_UNIFORM_TEXEL_BUFFER  ] = RADV_BUFFER_DESC_SIZE,
-   [S2I_DESC_STORAGE_TEXEL_BUFFER  ] = RADV_BUFFER_DESC_SIZE,
-   [S2I_DESC_UNIFORM_BUFFER        ] = RADV_BUFFER_DESC_SIZE,
-   [S2I_DESC_STORAGE_BUFFER        ] = RADV_BUFFER_DESC_SIZE,
-   [S2I_DESC_UNIFORM_BUFFER_DYNAMIC] = RADV_BUFFER_DESC_SIZE,
-   [S2I_DESC_STORAGE_BUFFER_DYNAMIC] = RADV_BUFFER_DESC_SIZE,
-   [S2I_DESC_INPUT_ATTACHMENT      ] = RADV_STORAGE_IMAGE_DESC_SIZE,
-   [S2I_DESC_INLINE_UNIFORM_BLOCK  ] = RADV_BUFFER_DESC_SIZE,
-   [S2I_DESC_ACCELERATION_STRUCTURE] = RADV_ACCEL_STRUCT_DESC_SIZE,
-};
+/* Per-element descriptor size, mirroring RADV's own sizing. A switch rather than a table because
+ * VkDescriptorType is sparse: its last members are extension values in the billions. */
+static uint32_t
+s2i_desc_size(VkDescriptorType type)
+{
+   switch (type) {
+   case VK_DESCRIPTOR_TYPE_SAMPLER:                return RADV_SAMPLER_DESC_SIZE;
+   case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: return RADV_STORAGE_IMAGE_DESC_SIZE +
+                                                          RADV_SAMPLER_DESC_SIZE;
+   case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:          return RADV_STORAGE_IMAGE_DESC_SIZE;
+   case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:          return RADV_STORAGE_IMAGE_DESC_SIZE;
+   case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:   return RADV_BUFFER_DESC_SIZE;
+   case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:   return RADV_BUFFER_DESC_SIZE;
+   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:         return RADV_BUFFER_DESC_SIZE;
+   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:         return RADV_BUFFER_DESC_SIZE;
+   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC: return RADV_BUFFER_DESC_SIZE;
+   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: return RADV_BUFFER_DESC_SIZE;
+   case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:       return RADV_STORAGE_IMAGE_DESC_SIZE;
+   case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:   return RADV_BUFFER_DESC_SIZE;
+   case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR: return RADV_ACCEL_STRUCT_DESC_SIZE;
+   default:                                        return 0;
+   }
+}
 
 /* Every descriptor set layout we allocate for one compile, so we can free them all afterwards. */
 struct s2i_layout_alloc {
@@ -139,18 +145,26 @@ s2i_alloc_set_layout(uint32_t binding_count, struct s2i_layout_alloc *a)
  * exact offsets/sizes only need to be self-consistent for offline reflection; what matters for the
  * ISA is each binding's type (drives the descriptor-load lowering) and its set/binding placement. */
 static bool
-s2i_build_fed_layout(const s2i_binding *bindings, size_t n, struct radv_shader_layout *layout,
+s2i_build_fed_layout(const VkDescriptorSetLayoutCreateInfo *const *set_layouts,
+                     uint32_t set_layout_count, struct radv_shader_layout *layout,
                      struct s2i_layout_alloc *a)
 {
    uint32_t nbind[MAX_SETS] = {0};
    bool used[MAX_SETS] = {false};
 
-   for (size_t i = 0; i < n; i++) {
-      if (bindings[i].set >= MAX_SETS || bindings[i].type >= S2I_DESC_TYPE_COUNT)
+   for (uint32_t s = 0; s < set_layout_count && s < MAX_SETS; s++) {
+
+      if (!set_layouts[s])
          continue;
-      used[bindings[i].set] = true;
-      if (bindings[i].binding + 1 > nbind[bindings[i].set])
-         nbind[bindings[i].set] = bindings[i].binding + 1;
+
+      used[s] = true;
+
+      for (uint32_t i = 0; i < set_layouts[s]->bindingCount; i++) {
+         const uint32_t b = set_layouts[s]->pBindings[i].binding;
+
+         if (b + 1 > nbind[s])
+            nbind[s] = b + 1;
+      }
    }
 
    struct radv_descriptor_set_layout *empty = s2i_alloc_set_layout(0, a);
@@ -171,18 +185,18 @@ s2i_build_fed_layout(const s2i_binding *bindings, size_t n, struct radv_shader_l
 
       uint32_t offset = 0;
       for (uint32_t b = 0; b < nbind[s]; b++) {
-         const s2i_binding *fb = NULL;
-         for (size_t i = 0; i < n; i++) {
-            if (bindings[i].set == s && bindings[i].binding == b) {
-               fb = &bindings[i];
+         const VkDescriptorSetLayoutBinding *fb = NULL;
+         for (uint32_t i = 0; i < set_layouts[s]->bindingCount; i++) {
+            if (set_layouts[s]->pBindings[i].binding == b) {
+               fb = &set_layouts[s]->pBindings[i];
                break;
             }
          }
 
          if (fb) {
-            uint32_t arr = fb->count ? fb->count : 1;
-            uint32_t sz = s2i_desc_size[fb->type];
-            dsl->binding[b].type = s2i_descriptor_type_to_vk(fb->type);
+            uint32_t arr = fb->descriptorCount ? fb->descriptorCount : 1;
+            uint32_t sz = s2i_desc_size(fb->descriptorType);
+            dsl->binding[b].type = fb->descriptorType;
             dsl->binding[b].array_size = arr;
             dsl->binding[b].offset = offset;
             dsl->binding[b].size = sz;
@@ -553,7 +567,8 @@ s2i_gate_extensions(s2i_features features, enum amd_gfx_level gfx, const char *t
 
 s2i_result
 s2i_amd_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2i_stage stage,
-                int target_index, const s2i_binding *bindings, size_t binding_count,
+                int target_index, const VkDescriptorSetLayoutCreateInfo *const *set_layouts,
+                             uint32_t set_layout_count,
                 s2i_features features_used, char **isa_text, s2i_stats_amd *stats, s2i_info *info, char **message)
 {
    if (isa_text)
@@ -623,7 +638,7 @@ s2i_amd_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2
    struct radv_shader_layout layout;
    memset(&layout, 0, sizeof(layout));
    struct s2i_layout_alloc lalloc = {0};
-   bool ok = (bindings && binding_count) ? s2i_build_fed_layout(bindings, binding_count, &layout, &lalloc)
+   bool ok = (set_layouts && set_layout_count) ? s2i_build_fed_layout(set_layouts, set_layout_count, &layout, &lalloc)
                                          : s2i_build_generic_layout(&layout, &lalloc);
    if (!ok) {
       s2i_free_layout(&lalloc);
@@ -808,8 +823,8 @@ s2i_rt_shader_to_nir(struct radv_compiler_info *ci, struct radv_shader_layout *l
 
 s2i_result
 s2i_amd_compile_rt_pipeline(const s2i_rt_shader *shaders, size_t shader_count, size_t entry_index,
-                            int compile_traversal, int target_index, const s2i_binding *bindings,
-                            size_t binding_count, s2i_features features_used, char **isa_text,
+                            int compile_traversal, int target_index, const VkDescriptorSetLayoutCreateInfo *const *set_layouts,
+                             uint32_t set_layout_count, s2i_features features_used, char **isa_text,
                             s2i_stats_amd *stats, char **message)
 {
    if (isa_text)
@@ -858,7 +873,7 @@ s2i_amd_compile_rt_pipeline(const s2i_rt_shader *shaders, size_t shader_count, s
    struct radv_shader_layout layout;
    memset(&layout, 0, sizeof(layout));
    struct s2i_layout_alloc lalloc = {0};
-   bool ok = (bindings && binding_count) ? s2i_build_fed_layout(bindings, binding_count, &layout, &lalloc)
+   bool ok = (set_layouts && set_layout_count) ? s2i_build_fed_layout(set_layouts, set_layout_count, &layout, &lalloc)
                                          : s2i_build_generic_layout(&layout, &lalloc);
    if (!ok) {
       s2i_free_layout(&lalloc);

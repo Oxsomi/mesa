@@ -10,6 +10,10 @@
  */
 #include "spirv2isa.h"
 
+/* What this tool will index, not what the library supports: the set arrays below are on
+ * its stack. A caller with more sets calls the library directly. */
+#define S2I_CLI_MAX_SETS 32
+
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -347,20 +351,27 @@ main(int argc, char **argv)
 
    const char *entry = argv[4];
 
-   /* Optional trailing args are descriptor bindings "set:binding:type" (type = s2i_descriptor_type),
-    * so we can exercise the caller-fed layout; with none, the backend uses its generic fallback. */
+   /* Optional trailing args are descriptor bindings "set:binding:type", where type is a
+    * VkDescriptorType, so the CLI exercises the same layout path a caller uses. They are collected
+    * into one VkDescriptorSetLayoutCreateInfo per set, which is what the library takes. */
 
    /* Every trailing argument names one binding, so that is exactly how many there can be. */
 
-   const size_t binding_capacity = (size_t)(argc > 5 ? argc - 5 : 0);
-   s2i_binding *bindings = binding_capacity ?
-      (s2i_binding *)calloc(binding_capacity, sizeof(*bindings)) : NULL;
-   size_t binding_count = 0;
+   const uint32_t binding_capacity = (uint32_t)(argc > 5 ? argc - 5 : 0);
 
-   if (binding_capacity && !bindings) {
+   VkDescriptorSetLayoutBinding *all_bindings = binding_capacity ?
+      (VkDescriptorSetLayoutBinding *)calloc(binding_capacity, sizeof(*all_bindings)) : NULL;
+   uint32_t *binding_sets = binding_capacity ?
+      (uint32_t *)calloc(binding_capacity, sizeof(*binding_sets)) : NULL;
+
+   if (binding_capacity && (!all_bindings || !binding_sets)) {
       fprintf(stderr, "out of memory\n");
+      free(all_bindings);
+      free(binding_sets);
       return 1;
    }
+
+   uint32_t binding_count = 0, highest_set = 0;
 
    for (int i = 5; i < argc; i++) {
 
@@ -369,35 +380,90 @@ main(int argc, char **argv)
 
       if (sscanf(argv[i], "%31[^:]:%31[^:]:%31s", setId, bindId, typeId) != 3) {
          fprintf(stderr, "bad binding '%s' (want set:binding:type)\n", argv[i]);
-         free(bindings);
+         free(all_bindings);
+         free(binding_sets);
          return 2;
       }
 
       if (!parse_u32(setId, &set) || !parse_u32(bindId, &bind) || !parse_u32(typeId, &type)) {
          fprintf(stderr, "binding '%s' has a field that isn't a number\n", argv[i]);
-         free(bindings);
+         free(all_bindings);
+         free(binding_sets);
          return 2;
       }
 
-      if (type >= S2I_DESC_TYPE_COUNT) {
-         fprintf(stderr, "binding '%s' has no descriptor type %u (0..%d)\n", argv[i], type,
-                 S2I_DESC_TYPE_COUNT - 1);
-         free(bindings);
+      /* The core descriptor types are 0..10; the two extension ones are the values Vulkan gives them,
+       * which is why this takes a VkDescriptorType rather than an index. */
+      if (type > VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT &&
+          type != VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK &&
+          type != VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) {
+         fprintf(stderr, "binding '%s' has no VkDescriptorType %u\n", argv[i], type);
+         free(all_bindings);
+         free(binding_sets);
          return 2;
       }
 
-      bindings[binding_count].set = set;
-      bindings[binding_count].binding = bind;
-      bindings[binding_count].type = (s2i_descriptor_type)type;
-      bindings[binding_count].count = 1;
+      if (set >= S2I_CLI_MAX_SETS) {
+         fprintf(stderr, "binding '%s' names set %u, and this tool goes up to %u\n", argv[i], set,
+                 S2I_CLI_MAX_SETS - 1);
+         free(all_bindings);
+         free(binding_sets);
+         return 2;
+      }
+
+      binding_sets[binding_count] = set;
+      all_bindings[binding_count] = (VkDescriptorSetLayoutBinding) {
+         .binding = bind,
+         .descriptorType = (VkDescriptorType)type,
+         .descriptorCount = 1,
+         .stageFlags = VK_SHADER_STAGE_ALL,
+      };
       binding_count++;
+
+      if (set > highest_set)
+         highest_set = set;
+   }
+
+   /* One create-info per set, laid out contiguously so each set's bindings are adjacent. */
+
+   VkDescriptorSetLayoutCreateInfo set_infos[S2I_CLI_MAX_SETS];
+   const VkDescriptorSetLayoutCreateInfo *set_layouts[S2I_CLI_MAX_SETS];
+   VkDescriptorSetLayoutBinding *sorted = binding_capacity ?
+      (VkDescriptorSetLayoutBinding *)calloc(binding_capacity, sizeof(*sorted)) : NULL;
+
+   if (binding_capacity && !sorted) {
+      fprintf(stderr, "out of memory\n");
+      free(all_bindings);
+      free(binding_sets);
+      return 1;
+   }
+
+   const uint32_t set_layout_count = binding_count ? highest_set + 1 : 0;
+   uint32_t written = 0;
+
+   for (uint32_t set = 0; set < set_layout_count; set++) {
+      const uint32_t first = written;
+
+      for (uint32_t i = 0; i < binding_count; i++) {
+         if (binding_sets[i] == set)
+            sorted[written++] = all_bindings[i];
+      }
+
+      set_infos[set] = (VkDescriptorSetLayoutCreateInfo) {
+         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+         .bindingCount = written - first,
+         .pBindings = written > first ? &sorted[first] : NULL,
+      };
+      set_layouts[set] = &set_infos[set];
    }
 
    size_t words = 0;
    uint32_t *spirv = read_spirv(argv[3], &words);
 
    if (!spirv) {
-      free(bindings);
+      free(all_bindings);
+      free(binding_sets);
+      free(sorted);
       return 1;
    }
 
@@ -411,8 +477,9 @@ main(int argc, char **argv)
    const char *ext_env = getenv("S2I_FEATURES");
    s2i_features features_used = ext_env ? (s2i_features)strtoul(ext_env, NULL, 0) : 0;
 
-   s2i_result r = s2i_compile(spirv, words, entry, stage, target, binding_count ? bindings : NULL,
-                              binding_count, features_used, &isa, &stats, &info, &msg);
+   s2i_result r = s2i_compile(spirv, words, entry, stage, target,
+                              set_layout_count ? set_layouts : NULL, set_layout_count,
+                              features_used, &isa, &stats, &info, &msg);
 
    fprintf(stderr, "target: %s -> result %d\n", s2i_target_name(target), (int)r);
 
@@ -438,6 +505,8 @@ main(int argc, char **argv)
    }
 
    free(spirv);
-   free(bindings);
+   free(all_bindings);
+      free(binding_sets);
+      free(sorted);
    return r == S2I_OK ? 0 : 1;
 }

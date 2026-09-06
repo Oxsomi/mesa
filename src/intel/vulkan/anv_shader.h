@@ -122,6 +122,16 @@ struct anv_shader_data {
    debug_archiver *archiver;
 };
 
+/* ANV's shader lowering, everything from multiview through the descriptor and push-constant passes.
+ * A pure function of the physical device behind `device` and the shader in `shader_data`, which is why
+ * an offline compiler can call it (see ANV_SHADER_LOWER_NIR_ONLY in anv_shader_compile.c). */
+struct vk_graphics_pipeline_state;
+
+void anv_shader_lower_nir(struct anv_device *device,
+                          void *mem_ctx,
+                          const struct vk_graphics_pipeline_state *state,
+                          struct anv_shader_data *shader_data);
+
 VkResult anv_shader_create(struct anv_device *device,
                            mesa_shader_stage stage,
                            void *mem_ctx,

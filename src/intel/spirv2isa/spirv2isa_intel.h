@@ -26,7 +26,8 @@ extern "C" {
  * `bindings` is the layout every resource is placed from, so a module that uses a descriptor the
  * caller did not describe cannot be compiled. */
 s2i_result s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2i_stage stage,
-                             int target_index, const s2i_binding *bindings, size_t binding_count,
+                             int target_index, const VkDescriptorSetLayoutCreateInfo *const *set_layouts,
+                             uint32_t set_layout_count,
                              s2i_features features_used, char **isa_text, s2i_stats_intel *stats,
                              s2i_info *info, char **message);
 

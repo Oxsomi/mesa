@@ -154,7 +154,8 @@ s2i_stats_fill_shared(s2i_stats *stats)
 
 s2i_result
 s2i_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2i_stage stage,
-            s2i_target target, const s2i_binding *bindings, size_t binding_count,
+            s2i_target target, const VkDescriptorSetLayoutCreateInfo *const *set_layouts,
+                             uint32_t set_layout_count,
             s2i_features features_used, char **isa_text, s2i_stats *stats, s2i_info *info,
             char **message)
 {
@@ -166,7 +167,7 @@ s2i_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2i_st
    s2i_result result = S2I_BAD_TARGET;
 
 #if !defined(S2I_HAVE_AMD) && !defined(S2I_HAVE_INTEL)
-   (void)spirv; (void)spirv_words; (void)entry; (void)stage; (void)bindings; (void)binding_count;
+   (void)spirv; (void)spirv_words; (void)entry; (void)stage; (void)set_layouts; (void)set_layout_count;
    (void)features_used; (void)isa_text; (void)info;
 #endif
 
@@ -182,8 +183,8 @@ s2i_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2i_st
 
 #ifdef S2I_HAVE_AMD
    case S2I_VENDOR_AMD:
-      result = s2i_amd_compile(spirv, spirv_words, entry, stage, S2I_TARGET_INDEX_OF(target), bindings,
-                               binding_count, features_used, isa_text, stats ? &stats->amd : NULL, info,
+      result = s2i_amd_compile(spirv, spirv_words, entry, stage, S2I_TARGET_INDEX_OF(target), set_layouts,
+                               set_layout_count, features_used, isa_text, stats ? &stats->amd : NULL, info,
                                message);
       break;
 #endif
@@ -197,8 +198,8 @@ s2i_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2i_st
       if (info)
          memset(info, 0, sizeof(*info));
 
-      result = s2i_intel_compile(spirv, spirv_words, entry, stage, S2I_TARGET_INDEX_OF(target), bindings,
-                                 binding_count, features_used, isa_text, stats ? &stats->intel : NULL,
+      result = s2i_intel_compile(spirv, spirv_words, entry, stage, S2I_TARGET_INDEX_OF(target), set_layouts,
+                                 set_layout_count, features_used, isa_text, stats ? &stats->intel : NULL,
                                  info, message);
       break;
 #endif
@@ -215,8 +216,8 @@ s2i_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2i_st
 
 s2i_result
 s2i_compile_rt_pipeline(const s2i_rt_shader *shaders, size_t shader_count, size_t entry_index,
-                        int compile_traversal, s2i_target target, const s2i_binding *bindings,
-                        size_t binding_count, s2i_features features_used, char **isa_text,
+                        int compile_traversal, s2i_target target, const VkDescriptorSetLayoutCreateInfo *const *set_layouts,
+                             uint32_t set_layout_count, s2i_features features_used, char **isa_text,
                         s2i_stats *stats, char **message)
 {
    const s2i_result targetResult = s2i_check_target(target, message);
@@ -230,16 +231,16 @@ s2i_compile_rt_pipeline(const s2i_rt_shader *shaders, size_t shader_count, size_
    }
 
 #ifndef S2I_HAVE_AMD
-   (void)shaders; (void)shader_count; (void)entry_index; (void)compile_traversal; (void)bindings;
-   (void)binding_count; (void)features_used; (void)isa_text;
+   (void)shaders; (void)shader_count; (void)entry_index; (void)compile_traversal; (void)set_layouts;
+   (void)set_layout_count; (void)features_used; (void)isa_text;
 #endif
 
 #ifdef S2I_HAVE_AMD
    if (S2I_TARGET_VENDOR_OF(target) == S2I_VENDOR_AMD) {
 
       const s2i_result result = s2i_amd_compile_rt_pipeline(
-         shaders, shader_count, entry_index, compile_traversal, S2I_TARGET_INDEX_OF(target), bindings,
-         binding_count, features_used, isa_text, stats ? &stats->amd : NULL, message);
+         shaders, shader_count, entry_index, compile_traversal, S2I_TARGET_INDEX_OF(target), set_layouts,
+         set_layout_count, features_used, isa_text, stats ? &stats->amd : NULL, message);
 
       if (result == S2I_OK && stats)
          s2i_stats_fill_shared(stats);

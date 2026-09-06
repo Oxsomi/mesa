@@ -23,7 +23,6 @@
 #include "compiler/shader_enums.h"        /* mesa_shader_stage / MESA_SHADER_* */
 #include "compiler/glsl_types.h"          /* glsl_type_singleton_init_or_ref/decref (no device inits it) */
 #include "compiler/nir/nir.h"             /* nir_shader, address formats, gather_info */
-#include "compiler/nir/nir_builder.h"     /* nir builder for the buffer-descriptor lowering */
 #include "compiler/spirv/nir_spirv.h"     /* spirv_to_nir + options */
 #include "compiler/spirv/spirv_info.h"    /* struct spirv_capabilities */
 #include "brw_compiler.h"                  /* brw_compiler_create, brw_compile, prog_data/key */
@@ -31,6 +30,7 @@
 #include "brw_nir.h"                       /* brw_preprocess_nir, brw_nir_lower_cs_intrinsics, brw_nir_lower_cmat */
 #include "brw_nir_rt.h"                    /* brw_nir_lower_ray_queries (inline ray tracing) */
 #include "anv_nir.h"                       /* ANV's descriptor, driver-value and multiview passes */
+#include "anv_shader.h"                     /* anv_shader_data + anv_shader_lower_nir */
 #include "spirv2isa_stage.h"
 #include "spirv2isa_intel_anv.h"           /* the inputs those passes read, built without a device */
 
@@ -159,35 +159,7 @@ s2i_intel_gate_extensions(s2i_features features, const char *target_name, char *
 
 
 
-/* Folds the address arithmetic ANV's descriptor passes leave behind, so anv_nir_lower_ubo_loads can
- * still see a constant offset. Skipping it also strands MAX_SETS-sized temp arrays in scratch. */
-static void
-s2i_intel_cleanup_nir(nir_shader *nir)
-{
-   bool progress;
 
-   do {
-      progress = false;
-      NIR_PASS(progress, nir, nir_opt_algebraic);
-      NIR_PASS(progress, nir, nir_opt_copy_prop);
-      NIR_PASS(progress, nir, nir_opt_constant_folding);
-      NIR_PASS(progress, nir, nir_opt_dce);
-   } while (progress);
-}
-
-/* brw uses a render target's index directly as a binding table index, so those entries are reserved
- * before descriptors claim any (ANV: anv_shader_compute_fragment_rts). Only the count matters. */
-static void
-s2i_intel_reserve_fragment_rts(nir_shader *nir, struct anv_pipeline_bind_map *map)
-{
-   if (nir->info.stage != MESA_SHADER_FRAGMENT)
-      return;
-
-   const uint64_t rt_mask = nir->info.outputs_written &
-                            BITFIELD64_RANGE(FRAG_RESULT_DATA0, MAX_DRAW_BUFFERS);
-
-   map->surface_count = util_bitcount64(rt_mask);
-}
 
 /* Every intrinsic that must be gone before brw sees the shader. brw_from_nir has no default case, so
  * one left here aborts with no explanation; naming it makes that an ordinary refusal instead. */
@@ -243,7 +215,8 @@ s2i_intel_first_unlowered(nir_shader *nir)
 
 s2i_result
 s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2i_stage stage,
-                  int target_index, const s2i_binding *bindings, size_t binding_count,
+                  int target_index, const VkDescriptorSetLayoutCreateInfo *const *set_layouts,
+                             uint32_t set_layout_count,
                   s2i_features features_used, char **isa_text, s2i_stats_intel *stats,
                   s2i_info *info, char **message)
 {
@@ -288,7 +261,7 @@ s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, 
    /* No device did this for us; the glsl type system uses a singleton linear allocator. */
    glsl_type_singleton_init_or_ref();
 
-   /* 1. device-free devinfo from a PCI id, then the brw compiler from just that. */
+   /* Device-free devinfo from a PCI id, then the brw compiler from just that. */
    struct intel_device_info devinfo;
    if (!intel_get_device_info_from_pci_id(s2i_intel_targets[target_index].pci_id, &devinfo)) {
       glsl_type_singleton_decref();
@@ -297,21 +270,16 @@ s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, 
          *message = strdup("intel_get_device_info_from_pci_id failed");
       return S2I_BAD_TARGET;
    }
-   /* mem_alignment is normally filled by the i915/xe kernel driver from a DRM query; the device-free
-    * PCI-id path leaves it 0, which makes brw's mem-access vectorizer compute align(end, MIN2(.., 0))
-    * and hit a util_is_power_of_two assert (only when adjacent accesses actually vectorize, e.g. a ray
-    * query's spilled struct).
-    * This is not a free constant: brw_nir.c's vectorizer refuses to widen a global load whose result
-    * would cross it, so it decides how many buffer loads merge, and therefore the instruction count.
-    * Derive it the way the kernel does (i915/intel_device_info.c), which is device-free: 64 KB from
-    * Xe-HPG on and for anything with local memory, 4 KB before that. */
+   /* Normally filled by the kernel from a DRM query, and left 0 by the PCI-id path. It gates brw's
+    * load/store vectorizer, so it decides how many loads merge and therefore the instruction count.
+    * Derived the way the kernel derives it (i915/intel_device_info.c). */
    if (devinfo.mem_alignment == 0)
       devinfo.mem_alignment = (devinfo.verx10 >= 125 || devinfo.has_local_mem) ? 64 * 1024 : 4096;
    struct brw_compiler *compiler = brw_compiler_create(mem_ctx, &devinfo);
 
    /* Must exist before spirv_to_nir: the address formats below are derived from it. */
    struct anv_physical_device *pdev = rzalloc(mem_ctx, struct anv_physical_device);
-   s2i_intel_anv_init_physical_device(pdev, &devinfo, compiler);
+   s2i_intel_anv_init_physical_device(pdev, &devinfo, compiler, mem_ctx);
 
    /* Caller-owned pipeline state, and it selects the UBO/SSBO address formats, so it moves the memory
     * instructions emitted. Nothing supplies it yet; it becomes a declared input, never a derived one. */
@@ -321,7 +289,7 @@ s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, 
 
    const mesa_shader_stage ms = s2i_stage_to_mesa(stage);
 
-   /* 2. SPIR-V -> NIR. Broad capability set so vtn never rejects a feature the module declares; a
+   /* SPIR-V -> NIR. Broad capability set so vtn never rejects a feature the module declares; a
     * feature the HW cannot do still fails later in brw. No debug callback (device would own it). */
    struct spirv_capabilities caps;
    memset(&caps, 0xff, sizeof(caps));
@@ -352,180 +320,94 @@ s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, 
 
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 
-   /* Cooperative matrix (KHR): brw lowers cmat ops to subgroup/DPAS ops. This must run BEFORE the
-    * descriptor passes, since it emits the matrix load/store memory accesses they then lower, and it
-    * needs a valid api subgroup size (ANV derives it device-side; offline we take the shader's declared
-    * size or default to a DPAS-friendly 16). cmat lowering emits cmat_call -> nir_call, so inline. */
-   if (ms == MESA_SHADER_COMPUTE && nir->info.cs.has_cooperative_matrix) {
-      if (nir->info.api_subgroup_size == 0)
-         nir->info.api_subgroup_size = 16;
-      /* brw_required_dispatch_width (brw_simd_selection.cpp) derives the REQUIRED width from
-       * min/max_subgroup_size and treats "both 0" as no requirement, so brw would be free to compile
-       * SIMD32 for code cmat just lowered for api_subgroup_size lanes. Pin them the way ANV's
-       * anv_fixup_subgroup_size does, so the compiled width matches what the lowering assumed. */
-      nir->info.min_subgroup_size = nir->info.api_subgroup_size;
-      nir->info.max_subgroup_size = nir->info.api_subgroup_size;
-      NIR_PASS(_, nir, brw_nir_lower_cmat, nir->info.api_subgroup_size);
-      NIR_PASS(_, nir, nir_opt_dce);
-      bool cmat_inlined = false;
-      NIR_PASS(cmat_inlined, nir, nir_inline_functions);
-      nir_remove_non_entrypoints(nir);
-      if (cmat_inlined) {
-         bool cmat_lowered_globals = false;
-         NIR_PASS(cmat_lowered_globals, nir, nir_lower_global_vars_to_local);
-         if (cmat_lowered_globals)
-            NIR_PASS(_, nir, nir_split_struct_vars, nir_var_function_temp);
-         NIR_PASS(_, nir, nir_opt_copy_prop_vars);
-         NIR_PASS(_, nir, nir_opt_copy_prop);
-      }
-      NIR_PASS(_, nir, nir_opt_deref);
-      NIR_PASS(_, nir, nir_opt_dce);
-      NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees, nir_var_function_temp, 16);
-      nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
-   }
-
-   NIR_PASS(_, nir, nir_lower_global_vars_to_local);
-   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
-   NIR_PASS(_, nir, nir_opt_copy_prop_vars);
-   NIR_PASS(_, nir, nir_opt_dce);
-
-   /* The format side of storage images, before ANV's lowering rewrites the derefs. Run it
-    * UNCONDITIONALLY: gather_info's num_images / num_textures / uses_bindless all skip a variable with
-    * an interface_type (nir_gather_info.c), so a descriptor-array image shader reports 0/0/0. */
-   NIR_PASS(_, nir, brw_nir_lower_storage_image, compiler,
-            &(struct brw_nir_lower_storage_image_opts){
-               .lower_loads = true,
-               .lower_stores_64bit = true,
-            });
-
-   /* 3. brw preprocessing (common); the stage-specific input lowering runs inside brw_compile_* for
-    * graphics, while compute needs brw_nir_lower_cs_intrinsics done here first (brw asserts it). */
+   /* brw preprocessing, which ANV runs in its own hook before the lowering below. */
    struct brw_nir_compiler_opts opts;
    memset(&opts, 0, sizeof(opts));
    brw_preprocess_nir(compiler, nir, &opts);
 
-   /* The view mask is caller-owned render-pass state; 0 is the single-view shader. Gated as ANV gates
-    * it, because the pass asserts on compute. */
-   if (ms <= MESA_SHADER_FRAGMENT)
-      NIR_PASS(_, nir, anv_nir_lower_multiview, 0 /* view_mask */, false /* primitive replication */);
-
-   /* Ray query (RayQueryKHR, e.g. inline ray tracing in a compute shader): brw lowers the opaque rq_*
-    * ops to its internal query representation; device-free it needs only devinfo (ANV passes exactly
-    * &pdevice->info). A no-op when the shader has no ray queries. The acceleration-structure handle
-    * it consumes is a descriptor, lowered with the others below. */
-   NIR_PASS(_, nir, brw_nir_lower_ray_queries, &devinfo);
-   /* SSA-ify the function_temp query struct it introduced, so brw sees resolved sources. */
-   NIR_PASS(_, nir, nir_lower_global_vars_to_local);
-   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
-   NIR_PASS(_, nir, nir_opt_copy_prop_vars);
-   NIR_PASS(_, nir, nir_opt_dce);
-
-   /* From here the descriptor rewriting is ANV's, in ANV's order (anv_shader_compile.c). We supply
-    * the layout it reads, nothing more. */
+   /* ANV's lowering, called rather than mirrored: cooperative matrix, storage images, multiview, ray
+    * queries, descriptors and the push-constant layout, in the order ANV maintains. */
 
    s2i_intel_anv_layouts layouts;
 
-   if (!s2i_intel_anv_build_layouts(pdev, bindings, binding_count, &layouts, message)) {
+   if (!s2i_intel_anv_build_layouts(pdev, set_layouts, set_layout_count, &layouts, message)) {
       glsl_type_singleton_decref();
       ralloc_free(mem_ctx);
       return S2I_UNSUPPORTED_CAP;
    }
 
-   struct anv_pipeline_bind_map bind_map;
-   memset(&bind_map, 0, sizeof(bind_map));
+   struct vk_shader_compile_info compile_info;
+   memset(&compile_info, 0, sizeof(compile_info));
+   compile_info.stage = ms;
+   compile_info.nir = nir;
+   compile_info.set_layouts = (struct vk_descriptor_set_layout **) layouts.sets;
+   compile_info.set_layout_count = layouts.set_count;
 
-   /* Zero is UNKNOWN, which is neither DIRECT nor INDIRECT; almost every site tests for one of those
-    * two, so leaving it builds handles with no set base and mixed strides, and never asserts. */
-   bind_map.layout_type = layouts.set_count > 0 ? layouts.sets[0]->type
-                                                : ANV_PIPELINE_DESCRIPTOR_SET_LAYOUT_TYPE_DIRECT;
+   struct anv_shader_data shader_data;
+   memset(&shader_data, 0, sizeof(shader_data));
+   shader_data.info = &compile_info;
 
-   bind_map.surface_to_descriptor = rzalloc_array(mem_ctx, struct anv_pipeline_binding, 256);
-   bind_map.sampler_to_descriptor = rzalloc_array(mem_ctx, struct anv_pipeline_binding, 256);
-
-   s2i_intel_reserve_fragment_rts(nir, &bind_map);
-
-   struct anv_pipeline_push_map push_map;
-   memset(&push_map, 0, sizeof(push_map));
-
-   NIR_PASS(_, nir, anv_nir_apply_pipeline_layout, pdev, robust_flags, layouts.sets,
-            layouts.set_count, layouts.dynamic_offset_start, false /* device_bindable */,
-            &bind_map, &push_map, mem_ctx);
-
-   /* The passes read the layouts, they do not keep them. */
-   s2i_intel_anv_free_layouts(&layouts);
-
-   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo, anv_nir_ubo_addr_format(pdev, robust_flags));
-   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo, anv_nir_ssbo_addr_format(pdev, robust_flags));
-
-   s2i_intel_cleanup_nir(nir);
-   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
-   s2i_intel_cleanup_nir(nir);
-
-   /* anv_nir_lower_ubo_loads READS the divergence flag rather than computing it, so without the
-    * analysis every UBO load looks uniform and gets a uniform-block load it must not have. */
-   NIR_PASS(_, nir, nir_convert_to_lcssa, true, true);
-   nir_divergence_analysis(nir);
-   NIR_PASS(_, nir, anv_nir_lower_ubo_loads);
-   NIR_PASS(_, nir, nir_opt_remove_phis);
-
-   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
-
-   /* Per-stage prog_data + key. brw_compile dispatches by nir->info.stage, so we use brw's own unions
-    * (brw_compiler.h) which are sized for every stage it can dispatch to. */
-   union brw_any_prog_data prog_data;
-   memset(&prog_data, 0, sizeof(prog_data));
-
-   union brw_any_prog_key prog_key;
-   memset(&prog_key, 0, sizeof(prog_key));
+   /* Caller-owned pipeline state, read out of the prog key by the lowering. Both move the ISA, and
+    * both become declared inputs the day s2i_compile carries them. */
+   shader_data.key.base.robust_flags = robust_flags;
+   shader_data.key.base.view_mask = 0;
 
    struct brw_stage_prog_data *base_prog_data;
    struct brw_base_prog_key *base_prog_key;
 
    if (ms == MESA_SHADER_COMPUTE) {
-      /* The driver values this introduces are lowered below, and anv_nir_compute_push_layout owns
-       * push_sizes and the brw_cs_fill_push_const_info call. */
-      brw_nir_lower_cs_intrinsics(nir, &devinfo, &prog_data.cs);
-
-      base_prog_data = &prog_data.cs.base;
-      base_prog_key = &prog_key.cs.base;
+      base_prog_data = &shader_data.prog_data.cs.base;
+      base_prog_key = &shader_data.key.cs.base;
    } else if (ms == MESA_SHADER_FRAGMENT) {
-      base_prog_data = &prog_data.fs.base;
-      base_prog_key = &prog_key.fs.base;
+      base_prog_data = &shader_data.prog_data.fs.base;
+      base_prog_key = &shader_data.key.fs.base;
    } else if (s2i_stage_is_rt(ms)) {
       /* All six RT stages compile through brw_compile_bs; brw_bs_prog_data nests the stage base
        * directly (like fragment, unlike the VUE stages). */
-      base_prog_data = &prog_data.bs.base;
-      base_prog_key = &prog_key.bs.base;
+      base_prog_data = &shader_data.prog_data.bs.base;
+      base_prog_key = &shader_data.key.bs.base;
    } else if (ms == MESA_SHADER_TASK || ms == MESA_SHADER_MESH) {
       /* Task/mesh prog_data nest brw_cs_prog_data (they dispatch like compute), so the stage base is
        * two levels down. Unlike compute, brw_compile_task/mesh run brw_nir_lower_cs_intrinsics
        * themselves, so we must not do it here. A mesh shader compiled on its own gets tue_map = NULL,
        * which brw explicitly supports (task and mesh need not be compiled together). */
-      base_prog_data = ms == MESA_SHADER_TASK ? &prog_data.task.base.base : &prog_data.mesh.base.base;
-      base_prog_key = ms == MESA_SHADER_TASK ? &prog_key.task.base : &prog_key.mesh.base;
+      base_prog_data = ms == MESA_SHADER_TASK ? &shader_data.prog_data.task.base.base : &shader_data.prog_data.mesh.base.base;
+      base_prog_key = ms == MESA_SHADER_TASK ? &shader_data.key.task.base : &shader_data.key.mesh.base;
    } else {
       /* VUE stages (vertex / geometry / tess-ctrl / tess-eval): the prog_data nests
        * brw_vue_prog_data -> brw_stage_prog_data; the union members overlap at offset 0, so the vs
        * view addresses the shared base. brw_compile_* casts to the real per-stage prog_data/key. */
-      base_prog_data = &prog_data.vs.base.base;
-      base_prog_key = &prog_key.vs.base;
+      base_prog_data = &shader_data.prog_data.vs.base.base;
+      base_prog_key = &shader_data.key.vs.base;
    }
 
-   /* ANV's passes read the stage off prog_data and run before brw_compile would set it. */
+   /* The lowering reads the stage off prog_data, and runs before brw_compile would set it. */
    base_prog_data->stage = ms;
 
-   /* None of these is optional: apply_pipeline_layout emits resource_intel that only
-    * lower_resource_intel removes, and lower_driver_values emits push offsets that only
-    * compute_push_layout turns into register numbers. */
-   NIR_PASS(_, nir, anv_nir_lower_driver_values, pdev);
-   NIR_PASS(_, nir, anv_nir_update_resource_intel_block);
-   NIR_PASS(_, nir, anv_nir_shrink_push_constant_ranges);
-   NIR_PASS(_, nir, anv_nir_compute_push_layout, pdev, robust_flags,
-            &(struct anv_nir_push_layout_info) { 0 }, base_prog_key, base_prog_data,
-            &bind_map, &push_map);
-   NIR_PASS(_, nir, anv_nir_lower_resource_intel, pdev, bind_map.layout_type);
+   /* Assigned outside the lowering, so it stays ours. Zero is UNKNOWN, which is neither DIRECT nor
+    * INDIRECT, and almost every site tests for one of those two. */
+   shader_data.bind_map.layout_type =
+      layouts.set_count > 0 ? layouts.sets[0]->type
+                            : ANV_PIPELINE_DESCRIPTOR_SET_LAYOUT_TYPE_DIRECT;
 
-   /* 4. compile to EU ISA. Use brw's own params union: every stage's params struct starts with the
+   shader_data.bind_map.surface_to_descriptor =
+      rzalloc_array(mem_ctx, struct anv_pipeline_binding, 256);
+   shader_data.bind_map.sampler_to_descriptor =
+      rzalloc_array(mem_ctx, struct anv_pipeline_binding, 256);
+
+   /* The lowering reads the physical device, plus the two fields anv_device mirrors from it. */
+   struct anv_device *device = rzalloc(mem_ctx, struct anv_device);
+   device->physical = pdev;
+   device->info = &pdev->info;
+   device->isl_dev = pdev->isl_dev;
+
+   anv_shader_lower_nir(device, mem_ctx, NULL /* graphics pipeline state */, &shader_data);
+
+   /* The passes read the layouts, they do not keep them. */
+   s2i_intel_anv_free_layouts(&layouts);
+
+
+   /* Compile to EU ISA. Use brw's own params union: every stage's params struct starts with the
     * shared .base, and the per-stage tails differ, so a single stage's struct is NOT a safe superset
     * for the others (fragment's max_polygons sits exactly where mesh keeps a wa_18019110168 function
     * pointer, for instance). Zero the union, fill .base, and set only the fields of the stage in hand;
@@ -559,7 +441,7 @@ s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, 
 
       struct brw_nir_lower_shader_calls_state calls_state = {
          .devinfo = &devinfo,
-         .key = &prog_key.bs,
+         .key = &shader_data.key.bs,
       };
       struct brw_nir_vectorize_mem_cb_data vectorize_cb_data = { .devinfo = &devinfo };
       const nir_lower_shader_calls_options call_opts = {
@@ -668,12 +550,12 @@ s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, 
        * brw_bs_prog_data instead. The fixed-function graphics stages have no single dispatch width, so
        * they keep 0. */
       if (ms == MESA_SHADER_COMPUTE || ms == MESA_SHADER_TASK || ms == MESA_SHADER_MESH) {
-         const unsigned m = ms == MESA_SHADER_COMPUTE ? prog_data.cs.prog_mask
-                          : ms == MESA_SHADER_TASK    ? prog_data.task.base.prog_mask
-                                                      : prog_data.mesh.base.prog_mask;
+         const unsigned m = ms == MESA_SHADER_COMPUTE ? shader_data.prog_data.cs.prog_mask
+                          : ms == MESA_SHADER_TASK    ? shader_data.prog_data.task.base.prog_mask
+                                                      : shader_data.prog_data.mesh.base.prog_mask;
          stats->simd_width = (m & 4) ? 32 : (m & 2) ? 16 : (m & 1) ? 8 : 0;
       } else if (s2i_stage_is_rt(ms)) {
-         stats->simd_width = prog_data.bs.simd_size;
+         stats->simd_width = shader_data.prog_data.bs.simd_size;
       }
    }
 

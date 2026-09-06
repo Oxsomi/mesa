@@ -22,14 +22,15 @@ extern "C" {
 
 /* s2i_compile for an AMD target, taking AMD's own stats. See s2i_compile for the arguments. */
 s2i_result s2i_amd_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2i_stage stage,
-                           int target_index, const s2i_binding *bindings, size_t binding_count,
+                           int target_index, const VkDescriptorSetLayoutCreateInfo *const *set_layouts,
+                             uint32_t set_layout_count,
                            s2i_features features_used, char **isa_text, s2i_stats_amd *stats,
                            s2i_info *info, char **message);
 
 /* s2i_compile_rt_pipeline for an AMD target. See s2i_compile_rt_pipeline for the arguments. */
 s2i_result s2i_amd_compile_rt_pipeline(const s2i_rt_shader *shaders, size_t shader_count, size_t entry_index,
-                                       int compile_traversal, int target_index, const s2i_binding *bindings,
-                                       size_t binding_count, s2i_features features_used, char **isa_text,
+                                       int compile_traversal, int target_index, const VkDescriptorSetLayoutCreateInfo *const *set_layouts,
+                             uint32_t set_layout_count, s2i_features features_used, char **isa_text,
                                        s2i_stats_amd *stats, char **message);
 
 /* The capabilities this target doesn't support, newline separated and malloc'd, or NULL for none. */

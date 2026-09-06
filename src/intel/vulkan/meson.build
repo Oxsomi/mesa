@@ -142,9 +142,10 @@ if not with_intel_vk
   libanv_nir_lowering = static_library(
     'anv_nir_lowering',
     files(
-      # compiled a second time, layout arithmetic only, the way genX_*.c is compiled per
-      # generation: no fork of the rules, and no driver linked with them
+      # compiled a second time each, the way genX_*.c is compiled per generation: the layout
+      # arithmetic and the shader lowering, with none of the driver that normally surrounds them
       'anv_descriptor_set.c',
+      'anv_shader_compile.c',
       'anv_nir_apply_pipeline_layout.c',
       'anv_nir_compute_push_layout.c',
       'anv_nir_lower_driver_values.c',
@@ -152,12 +153,20 @@ if not with_intel_vk
       'anv_nir_lower_resource_intel.c',
       'anv_nir_lower_ubo_loads.c',
       'anv_nir_push_constants_analysis.c',
+      'anv_nir_push_descriptor_analysis.c',
+      'anv_nir_clear_shader_analysis.c',
+      'anv_nir_lower_unaligned_dispatch.c',
+      'anv_nir_realign_cbv.c',
+      'anv_nir_xe2_r11g11b10_atomic_wa.c',
       # the one function the lowering needs out of the Vulkan util library, which a
       # build without a driver does not otherwise link
       '../../vulkan/util/vk_format.c',
+      '../../vulkan/runtime/vk_nir_convert_ycbcr.c',
+      # the SLM sizing the compute push layout needs
+      '../common/intel_compute_slm.c',
     ),
     include_directories : anv_nir_lowering_incs,
-    c_args : anv_flags + ['-DANV_DESCRIPTOR_SET_LAYOUT_ONLY'],
+    c_args : anv_flags + ['-DANV_DESCRIPTOR_SET_LAYOUT_ONLY', '-DANV_SHADER_LOWER_NIR_ONLY'],
     dependencies : [
       idep_anv_headers, idep_anv_drirc, idep_vulkan_util_headers,
       idep_vulkan_generated_headers, idep_genxml, idep_nir_headers,

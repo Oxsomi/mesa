@@ -27,6 +27,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include <vulkan/vulkan_core.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -176,37 +178,19 @@ typedef enum s2i_stage {
 } s2i_stage;
 
 /*
- * Descriptor binding, supplied by the caller (OxC3 has the full binding layout from its oiSH
- * reflection). Each backend builds the descriptor set layouts its SPIR-V descriptor lowering needs
- * from these, instead of guessing a generic layout. The type drives how the descriptor is lowered (a
- * buffer, an image, a sampler, an acceleration structure...); the set/binding place it so the
- * SPIR-V's DescriptorSet/Binding decorations resolve.
- * The members are dense so a backend can index a table with them, which VkDescriptorType is not: its
- * last two members are extension values in the billions. A backend translates, and must never cast.
+ * Descriptor set layouts, supplied by the caller exactly as Vulkan describes them: one create-info per
+ * descriptor set, indexed by set number, with NULL for a set the pipeline layout leaves empty.
+ *
+ * These are passed to the vendor's own layout arithmetic rather than summarised first, because the
+ * summary would have to drop things that change the generated ISA: per-binding VkDescriptorBindingFlags
+ * (UPDATE_AFTER_BIND and PARTIALLY_BOUND decide whether a descriptor is bindless), the set's own
+ * VkDescriptorSetLayoutCreateFlags (DESCRIPTOR_BUFFER_BIT_EXT selects a different descriptor model
+ * entirely), mutable descriptor types, and variable descriptor counts.
+ *
+ * pImmutableSamplers must be NULL: they are VkSampler handles, which are live driver objects, and this
+ * compiles without a driver. A ycbcr immutable sampler would change plane counts and therefore binding
+ * indices, so a layout that needs one cannot be compiled offline rather than being compiled wrongly.
  */
-typedef enum s2i_descriptor_type {
-   S2I_DESC_SAMPLER = 0,
-   S2I_DESC_COMBINED_IMAGE_SAMPLER,
-   S2I_DESC_SAMPLED_IMAGE,
-   S2I_DESC_STORAGE_IMAGE,
-   S2I_DESC_UNIFORM_TEXEL_BUFFER,
-   S2I_DESC_STORAGE_TEXEL_BUFFER,
-   S2I_DESC_UNIFORM_BUFFER,
-   S2I_DESC_STORAGE_BUFFER,
-   S2I_DESC_UNIFORM_BUFFER_DYNAMIC,
-   S2I_DESC_STORAGE_BUFFER_DYNAMIC,
-   S2I_DESC_INPUT_ATTACHMENT,
-   S2I_DESC_INLINE_UNIFORM_BLOCK,
-   S2I_DESC_ACCELERATION_STRUCTURE,
-   S2I_DESC_TYPE_COUNT
-} s2i_descriptor_type;
-
-typedef struct s2i_binding {
-   uint32_t set;                 /* descriptor set index (0..31) */
-   uint32_t binding;             /* binding number within the set */
-   uint32_t count;               /* array size; 0 is treated as 1 */
-   s2i_descriptor_type type;
-} s2i_binding;
 
 /* AMD register and memory usage. */
 typedef struct s2i_stats_amd {
@@ -279,7 +263,7 @@ typedef enum s2i_result {
  * thin and non-fragile.
  *   entry         : entrypoint name (required, OxC3 always has it).
  *   stage         : the pipeline stage (OxC3 maps ESHPipelineStage -> s2i_stage).
- *   bindings      : descriptor bindings the module uses (may be NULL for none / a quick test, in
+ *   set_layouts   : descriptor set layouts, indexed by set (may be NULL for none / a quick test, in
  *                   which case a permissive generic layout is synthesized as a fallback). A backend
  *                   that builds a descriptor layout consumes this; one that places resources from
  *                   the module's own decorations only validates it. Either way a module needing a
@@ -300,7 +284,9 @@ typedef enum s2i_result {
  *   message       : out, optional diagnostic string on error, malloc'd (caller frees if non-NULL).
  */
 s2i_result s2i_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2i_stage stage,
-                       s2i_target target, const s2i_binding *bindings, size_t binding_count,
+                       s2i_target target,
+                       const VkDescriptorSetLayoutCreateInfo *const *set_layouts,
+                       uint32_t set_layout_count,
                        s2i_features features_used, char **isa_text, s2i_stats *stats, s2i_info *info,
                        char **message);
 
@@ -331,8 +317,9 @@ typedef struct s2i_rt_shader {
  * isa_text/stats/message as in s2i_compile.
  */
 s2i_result s2i_compile_rt_pipeline(const s2i_rt_shader *shaders, size_t shader_count, size_t entry_index,
-                                   int compile_traversal, s2i_target target, const s2i_binding *bindings,
-                                   size_t binding_count, s2i_features features_used, char **isa_text,
+                                   int compile_traversal, s2i_target target,
+                                   const VkDescriptorSetLayoutCreateInfo *const *set_layouts,
+                                   uint32_t set_layout_count, s2i_features features_used, char **isa_text,
                                    s2i_stats *stats, char **message);
 
 /*
