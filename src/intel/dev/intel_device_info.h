@@ -188,6 +188,10 @@ intel_vram_all_mappable(const struct intel_device_info *devinfo)
 bool intel_get_device_info_from_fd(int fh, struct intel_device_info *devinfo, int min_ver, int max_ver);
 bool intel_get_device_info_from_pci_id(int pci_id,
                                        struct intel_device_info *devinfo);
+
+/* Fills max_scratch_ids[], which the device path derives from a kernel query. A pure function of the
+ * rest of the device info, so a caller without a device can reach it too. */
+void intel_device_info_init_max_scratch_ids(struct intel_device_info *devinfo);
 bool intel_get_device_info_for_build(int pci_id,
                                      struct intel_device_info *devinfo);
 

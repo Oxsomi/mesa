@@ -1838,6 +1838,11 @@ enum anv_debug {
 
 extern enum anv_debug anv_debug;
 
+#ifdef ANV_PHYSICAL_DEVICE_FEATURES_ONLY
+/* anv_physical_device.c's feature-table region; see the guard there. */
+void anv_physical_device_offline_supported(struct anv_physical_device *pdevice);
+#endif
+
 #define ANV_DEBUG(name) unlikely(anv_debug & ANV_DEBUG_##name)
 
 static inline bool anv_needs_printf_buffer(void)

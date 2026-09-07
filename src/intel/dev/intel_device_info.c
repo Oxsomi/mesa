@@ -1759,8 +1759,8 @@ intel_device_info_adjust_memory(struct intel_device_info *devinfo)
    }
 }
 
-static void
-init_max_scratch_ids(struct intel_device_info *devinfo)
+void
+intel_device_info_init_max_scratch_ids(struct intel_device_info *devinfo)
 {
    /* Determine the max subslice that potentially might be used in
     * scratch space ids.
@@ -2017,7 +2017,7 @@ intel_get_device_info_from_fd(int fd, struct intel_device_info *devinfo, int min
    assert(devinfo->subslice_total >= 1 || devinfo->ver <= 7);
    devinfo->subslice_total = MAX2(devinfo->subslice_total, 1);
 
-   init_max_scratch_ids(devinfo);
+   intel_device_info_init_max_scratch_ids(devinfo);
 
    for (enum intel_engine_class engine = INTEL_ENGINE_CLASS_RENDER;
         engine < ARRAY_SIZE(devinfo->engine_class_prefetch); engine++)

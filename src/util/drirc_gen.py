@@ -79,6 +79,29 @@ class DrircOption(object):
         self.c_name = c_name
         self.c_args = []
 
+    @property
+    def default_c(self):
+        """The default as a C literal, or None for options with no literal form."""
+        value = getattr(self, "value", None)
+
+        if value is None:
+            return None
+
+        if self.dtype == DrircOptionType.BOOL:
+            return "true" if value else "false"
+
+        if self.dtype == DrircOptionType.UINT64:
+            return f"{int(value)}ull"
+
+        if self.dtype == DrircOptionType.FLOAT:
+            return f"{float(value)}f"
+
+        if self.dtype == DrircOptionType.INT:
+            return str(int(value))
+
+        # enums carry a name, and strings need storage, so neither has a literal worth emitting
+        return None
+
 class DrircBool(DrircOption):
     def __init__(self, name, value, description="", c_name=None):
         super().__init__(DrircOptionType.BOOL, name, description, c_name)
@@ -182,6 +205,10 @@ struct ${driver_prefix}_drirc {
 void ${driver_prefix}_parse_dri_options(struct ${driver_prefix}_drirc *drirc,
                                         const driConfigFileParseParams *params);
 
+/* The built-in defaults, without reading any configuration file. For a consumer that must not depend
+ * on the machine it runs on, and therefore cannot call the parser above. */
+void ${driver_prefix}_drirc_defaults(struct ${driver_prefix}_drirc *drirc);
+
 #ifdef __cplusplus
 }
 #endif
@@ -208,6 +235,10 @@ DRI_CONF_SECTION_END
 % endfor
 };
 
+/* Reading configuration files needs xmlconfig, which needs a POSIX directory scan. A consumer that
+ * only wants the defaults compiles this file with ${driver_prefix.upper()}_DRIRC_DEFAULTS_ONLY and links neither. */
+#ifndef ${driver_prefix.upper()}_DRIRC_DEFAULTS_ONLY
+
 void
 ${driver_prefix}_parse_dri_options(struct ${driver_prefix}_drirc *drirc,
                                    const driConfigFileParseParams *params)
@@ -219,6 +250,22 @@ ${driver_prefix}_parse_dri_options(struct ${driver_prefix}_drirc *drirc,
 %   for option in section.options:
 %     if option.c_name is not None:
    drirc->${section.c_name}.${option.c_name} = ${type_to_queryfn(option.dtype)}(&drirc->options, "${option.name}");
+%     endif
+%   endfor
+% endfor
+}
+
+#endif /* ${driver_prefix.upper()}_DRIRC_DEFAULTS_ONLY */
+
+void
+${driver_prefix}_drirc_defaults(struct ${driver_prefix}_drirc *drirc)
+{
+   memset(drirc, 0, sizeof(*drirc));
+
+% for section in sections:
+%   for option in section.options:
+%     if option.c_name is not None and option.default_c is not None:
+   drirc->${section.c_name}.${option.c_name} = ${option.default_c};
 %     endif
 %   endfor
 % endfor

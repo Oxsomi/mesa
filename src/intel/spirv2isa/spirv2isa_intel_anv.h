@@ -36,6 +36,8 @@ typedef struct s2i_intel_anv_layouts {
    struct anv_descriptor_set_layout *sets[S2I_INTEL_ANV_MAX_SETS];
    uint32_t dynamic_offset_start[S2I_INTEL_ANV_MAX_SETS];
    uint32_t set_count;
+   /* One plain sampler standing in for every immutable sampler handle; see the substitution note. */
+   struct anv_sampler *stand_in_sampler;
 } s2i_intel_anv_layouts;
 
 /* Fills a zeroed anv_physical_device with the four things the lowering reads, all derived from the

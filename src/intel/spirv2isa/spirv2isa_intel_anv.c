@@ -8,12 +8,16 @@
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <stdio.h>
 
 #include "spirv2isa_intel_anv.h"
 #include "spirv2isa_desc.h"
 
 #include "util/ralloc.h"
+#include "anv_api_version.h"
+#include "anv_drirc.h"
+#include "vk_log.h"
 #include "anv_private.h"
 #include "isl/isl.h"
 #include "dev/intel_device_info.h"
@@ -25,6 +29,23 @@ static_assert(S2I_INTEL_ANV_MAX_SETS == MAX_SETS,
  * parsed, so an environment variable cannot silently change the ISA this tool reports. Defining it
  * here also keeps anv_instance.c, and the whole instance and entrypoint world, out of the link. */
 enum anv_debug anv_debug;
+
+/* vk_nir logs SPIR-V diagnostics through the instance's debug messengers, which an offline compile
+ * has none of; stderr is where a command line tool's diagnostics belong. */
+void
+__vk_log_impl(VkDebugUtilsMessageSeverityFlagBitsEXT severity, VkDebugUtilsMessageTypeFlagsEXT types,
+              int object_count, const void **objects_or_instance, const char *file, int line,
+              const char *format, ...)
+{
+   (void)severity; (void)types; (void)object_count; (void)objects_or_instance;
+
+   va_list args;
+   va_start(args, format);
+   fprintf(stderr, "%s:%d: ", file, line);
+   vfprintf(stderr, format, args);
+   fputc('\n', stderr);
+   va_end(args);
+}
 
 /* ANV builds a softfp64 helper library on the device when a shader wants doubles on hardware without
  * them. Its only caller is gated behind drirc.debug.fp64_emu, which a synthesized instance leaves off,
@@ -45,10 +66,18 @@ s2i_intel_anv_init_physical_device(struct anv_physical_device *pdev,
 {
    memset(pdev, 0, sizeof(*pdev));
 
-   /* The lowering reads one drirc option through the instance, so there has to be one. Zeroed means
-    * every debug option is off, which is the only honest answer offline: they exist to let a user
-    * perturb a driver, and there is no user here. */
+   /* The lowering reads driconf options through the instance, and several of them default to true or
+    * to a non-zero number: the vertex payload budget, component packing, the spilling rate, the active
+    * thread barrier emulation. A zeroed instance silently answers false or zero to all of them, so the
+    * options are parsed the way ANV parses them, which is also how the defaults stay in one place. */
    pdev->instance = rzalloc(mem_ctx, struct anv_instance);
+
+   anv_drirc_defaults(&pdev->instance->drirc);
+
+   /* The generated SPIR-V capability mapping reads the API version off the instance and the
+    * supported tables off the physical device; both are what ANV itself would report. */
+   pdev->instance->vk.app_info.api_version = ANV_API_VERSION;
+   pdev->vk.instance = &pdev->instance->vk;
 
    pdev->info = *devinfo;
    pdev->compiler = compiler;
@@ -60,11 +89,26 @@ s2i_intel_anv_init_physical_device(struct anv_physical_device *pdev,
    pdev->isl_dev.buffer_length_in_aux_addr = !intel_needs_workaround(devinfo, 14019708328);
    pdev->indirect_descriptors = !intel_has_extended_bindless(devinfo);
 
-   /* This one is not: ANV derives it from the kernel mode driver, which no PCI id carries, and it
-    * selects between binding-table and fully bindless codegen. This matches ANV on a kernel with the
-    * state-cache fix, which is what 00-anv-defaults.conf assumes, and is reported to the caller
-    * rather than left as a default nobody can see. */
-   pdev->rt_change_needs_flush = !devinfo->has_lsc;
+   /* ANV's own expression (anv_physical_device.c). The kernel mode driver is the one input a PCI id
+    * cannot carry, and INTEL_KMD_TYPE_INVALID is what an offline device reports, so this lands on the
+    * same answer ANV gives an application whose engine name does not appear in 00-anv-defaults.conf,
+    * which is every engine but one. */
+   const bool platform_supports_btp_bit_rcc =
+      devinfo->has_lsc &&
+      (devinfo->kmd_type == INTEL_KMD_TYPE_I915 || devinfo->xe_has_state_cache_perf_fix);
+
+   pdev->rt_change_needs_flush =
+      !pdev->instance->drirc.perf.state_cache_perf_fix || !platform_supports_btp_bit_rcc;
+
+   /* Scratch ids are a kernel query on the device path and stay zero here, which silently folds the
+    * per-invocation ray query stack to a single slot. Derived from the device info instead. */
+   intel_device_info_init_max_scratch_ids(&pdev->info);
+
+   /* brw reads both off the compiler, and ANV sets both from driconf. */
+   compiler->spilling_rate = pdev->instance->drirc.debug.shader_spilling_rate;
+   compiler->limit_trig_input_range = pdev->instance->drirc.debug.limit_trig_input_range;
+
+   anv_physical_device_offline_supported(pdev);
 }
 
 static struct anv_descriptor_set_layout *
@@ -141,27 +185,69 @@ s2i_intel_anv_build_layouts(const struct anv_physical_device *pdev,
 
       uint32_t dynamic_in_set = 0;
 
+      bool any_immutable = false;
+
       for (uint32_t b = 0; b < ci->bindingCount; b++) {
 
-         /* A VkSampler is a live driver object, and there is no driver here. A ycbcr immutable sampler
-          * changes plane counts and therefore binding indices, so this refuses rather than lays the set
-          * out as if the sampler were not there. */
-         if (ci->pBindings[b].pImmutableSamplers) {
+         if (ci->pBindings[b].pImmutableSamplers)
+            any_immutable = true;
 
-            if (message) {
-               char buf[160];
-               snprintf(buf, sizeof(buf),
-                        "set %u binding %u has immutable samplers, which are driver objects an offline "
-                        "compile cannot resolve", set, ci->pBindings[b].binding);
-               *message = strdup(buf);
-            }
+         if (s2i_descriptor_type_is_dynamic(ci->pBindings[b].descriptorType))
+            dynamic_in_set += ci->pBindings[b].descriptorCount;
+      }
 
+      /* The handles in pImmutableSamplers are live driver objects a caller cannot have here, so every
+       * one of them is replaced by a single plain sampler before ANV's arithmetic reads them. The
+       * layout math consumes exactly three things off a sampler: the plane count (1 for anything
+       * without a ycbcr conversion), the ycbcr conversion (none), and the embedded key (only behind a
+       * flag this build refuses). A ycbcr immutable sampler changes plane counts and therefore binding
+       * indices, and is NOT expressible offline; a caller using one gets a layout laid out for plane
+       * count 1, which is the one divergence this substitution carries. */
+      VkDescriptorSetLayoutCreateInfo local_ci;
+      VkDescriptorSetLayoutBinding *local_bindings = NULL;
+      VkSampler *stand_ins = NULL;
+
+      if (any_immutable) {
+
+         if (!out->stand_in_sampler) {
+            out->stand_in_sampler = calloc(1, sizeof(*out->stand_in_sampler));
+
+            if (out->stand_in_sampler)
+               out->stand_in_sampler->state.n_planes = 1;
+         }
+
+         uint32_t max_count = 0;
+
+         for (uint32_t b = 0; b < ci->bindingCount; b++)
+            max_count = MAX2(max_count, ci->pBindings[b].descriptorCount);
+
+         local_bindings = calloc(ci->bindingCount, sizeof(*local_bindings));
+         stand_ins = calloc(max_count ? max_count : 1, sizeof(*stand_ins));
+
+         if (!out->stand_in_sampler || !local_bindings || !stand_ins) {
+
+            if (message)
+               *message = strdup("out of memory building a descriptor set layout");
+
+            free(local_bindings);
+            free(stand_ins);
             s2i_intel_anv_free_layouts(out);
             return false;
          }
 
-         if (s2i_descriptor_type_is_dynamic(ci->pBindings[b].descriptorType))
-            dynamic_in_set += ci->pBindings[b].descriptorCount;
+         for (uint32_t i = 0; i < (max_count ? max_count : 1); i++)
+            stand_ins[i] = anv_sampler_to_handle(out->stand_in_sampler);
+
+         for (uint32_t b = 0; b < ci->bindingCount; b++) {
+            local_bindings[b] = ci->pBindings[b];
+
+            if (local_bindings[b].pImmutableSamplers)
+               local_bindings[b].pImmutableSamplers = stand_ins;
+         }
+
+         local_ci = *ci;
+         local_ci.pBindings = local_bindings;
+         ci = &local_ci;
       }
 
       /* Dynamic offsets are numbered across the whole pipeline layout, so a set starts where the
@@ -170,6 +256,9 @@ s2i_intel_anv_build_layouts(const struct anv_physical_device *pdev,
       dynamic_total += dynamic_in_set;
 
       out->sets[set] = s2i_intel_anv_build_one(pdev, ci, dynamic_in_set);
+
+      free(local_bindings);
+      free(stand_ins);
 
       if (!out->sets[set]) {
 
@@ -197,4 +286,7 @@ s2i_intel_anv_free_layouts(s2i_intel_anv_layouts *layouts)
    }
 
    layouts->set_count = 0;
+
+   free(layouts->stand_in_sampler);
+   layouts->stand_in_sampler = NULL;
 }

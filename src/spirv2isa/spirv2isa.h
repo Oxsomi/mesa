@@ -187,9 +187,10 @@ typedef enum s2i_stage {
  * VkDescriptorSetLayoutCreateFlags (DESCRIPTOR_BUFFER_BIT_EXT selects a different descriptor model
  * entirely), mutable descriptor types, and variable descriptor counts.
  *
- * pImmutableSamplers must be NULL: they are VkSampler handles, which are live driver objects, and this
- * compiles without a driver. A ycbcr immutable sampler would change plane counts and therefore binding
- * indices, so a layout that needs one cannot be compiled offline rather than being compiled wrongly.
+ * pImmutableSamplers: presence is what matters, not the handles, which may all be VK_NULL_HANDLE
+ * (they are live driver objects a caller cannot create here). Every immutable sampler is treated as a
+ * plain non-ycbcr sampler; a ycbcr immutable sampler changes plane counts and therefore binding
+ * indices, and is not expressible offline, so a layout built around one diverges from the driver's.
  */
 
 /* AMD register and memory usage. */
@@ -208,6 +209,7 @@ typedef struct s2i_stats_intel {
    uint32_t scratch_size;   /* per-thread scratch bytes */
    uint32_t shared_size;    /* SLM / shared-local-memory bytes */
    uint32_t simd_width;     /* dispatch width (compute): 8 / 16 / 32 */
+   uint32_t stack_size;     /* ray tracing: per-ray stack bytes, which scratch does not cover */
 } s2i_stats_intel;
 
 /*

@@ -132,6 +132,36 @@ void anv_shader_lower_nir(struct anv_device *device,
                           const struct vk_graphics_pipeline_state *state,
                           struct anv_shader_data *shader_data);
 
+#ifdef ANV_SHADER_LOWER_NIR_ONLY
+/* The offline entry points at the end of anv_shader_compile.c's device-free region. */
+
+struct vk_graphics_pipeline_state;
+struct vk_pipeline_robustness_state;
+union brw_any_compile_params;
+
+const struct nir_shader_compiler_options *
+anv_shader_offline_nir_options(struct vk_physical_device *device, mesa_shader_stage stage,
+                               const struct vk_pipeline_robustness_state *rs);
+
+struct spirv_to_nir_options
+anv_shader_offline_spirv_options(struct vk_physical_device *device, mesa_shader_stage stage,
+                                 const struct vk_pipeline_robustness_state *rs);
+
+void anv_shader_offline_preprocess(struct vk_physical_device *device, nir_shader *nir,
+                                   const struct vk_pipeline_robustness_state *rs);
+
+void anv_shader_offline_populate_key(struct vk_physical_device *device,
+                                     struct anv_shader_data *shader_data,
+                                     const struct vk_graphics_pipeline_state *state,
+                                     VkShaderStageFlags link_stages);
+
+void anv_shader_offline_finish(struct anv_device *device,
+                               struct anv_shader_data *shader_data,
+                               nir_shader *intersection_any_hit,
+                               union brw_any_compile_params *params,
+                               void *mem_ctx);
+#endif /* ANV_SHADER_LOWER_NIR_ONLY */
+
 VkResult anv_shader_create(struct anv_device *device,
                            mesa_shader_stage stage,
                            void *mem_ctx,

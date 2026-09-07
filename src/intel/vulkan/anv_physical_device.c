@@ -1154,6 +1154,11 @@ anx_get_physical_device_max_heap_size(const struct anv_physical_device *pdevice)
    return ret;
 }
 
+/* Everything above is a pure function of the physical device: the extension and feature
+ * tables. Everything below talks to a kernel or allocates, so a build that only wants the
+ * tables (ANV_PHYSICAL_DEVICE_FEATURES_ONLY) stops here. */
+#ifndef ANV_PHYSICAL_DEVICE_FEATURES_ONLY
+
 static void
 get_properties_1_1(const struct anv_physical_device *pdevice,
                    struct vk_properties *p)
@@ -3625,3 +3630,18 @@ VkDeviceSize anv_GetPhysicalDeviceDescriptorSizeEXT(
       return 0;
    }
 }
+
+#endif /* ANV_PHYSICAL_DEVICE_FEATURES_ONLY */
+
+#ifdef ANV_PHYSICAL_DEVICE_FEATURES_ONLY
+
+/* For the offline compiler: what this physical device supports, filled by the same tables the driver
+ * fills it from, so the SPIR-V capability gate cannot drift from the driver's. */
+void
+anv_physical_device_offline_supported(struct anv_physical_device *pdevice)
+{
+   get_device_extensions(pdevice, &pdevice->vk.supported_extensions);
+   get_features(pdevice, &pdevice->vk.supported_features);
+}
+
+#endif /* ANV_PHYSICAL_DEVICE_FEATURES_ONLY */

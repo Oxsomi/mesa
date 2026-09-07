@@ -32,6 +32,7 @@ libspirv2isa_intel = static_library(
   'spirv2isa_intel',
   files('spirv2isa_intel.c', 'spirv2isa_intel_anv.c'),
   include_directories : spirv2isa_intel_incs,
+  c_args : ['-DANV_SHADER_LOWER_NIR_ONLY', '-DANV_PHYSICAL_DEVICE_FEATURES_ONLY'],
   dependencies : spirv2isa_intel_deps,
   build_by_default : false,
 )

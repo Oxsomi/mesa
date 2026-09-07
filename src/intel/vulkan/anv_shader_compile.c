@@ -1645,14 +1645,7 @@ anv_shader_lower_nir(struct anv_device *device,
       shader_data->bind_map.inferred_behavior = anv_nir_clear_shader_analysis(nir);
 }
 
-/*
- * Everything above is a pure function of an anv_physical_device and a shader: no device, no cache, no
- * pipeline. Compiling this file with ANV_SHADER_LOWER_NIR_ONLY stops here, so an offline compiler can
- * run anv_shader_lower_nir, ANV's real lowering in ANV's real order, instead of keeping a copy of that
- * order which a rebase could silently reorder underneath it.
- * Below is the driver's own orchestration: the shader cache, the pipeline entrypoints and the archiver.
- */
-#ifndef ANV_SHADER_LOWER_NIR_ONLY
+
 
 static uint32_t
 sets_layout_embedded_sampler_count(const struct vk_shader_compile_info *info)
@@ -1811,6 +1804,138 @@ anv_shaders_post_lower_rt(struct anv_device *device,
       }
    }
 }
+
+#ifdef ANV_SHADER_LOWER_NIR_ONLY
+
+/*
+ * Entry points for the offline compiler, which drives the statics above the way the compile driver
+ * below this guard drives them for a pipeline. Each switch here has its twin in that driver; they
+ * live in one file so a change to either is edited in sight of the other.
+ */
+
+const struct nir_shader_compiler_options *
+anv_shader_offline_nir_options(struct vk_physical_device *device, mesa_shader_stage stage,
+                               const struct vk_pipeline_robustness_state *rs)
+{
+   return anv_shader_get_nir_options(device, stage, rs);
+}
+
+struct spirv_to_nir_options
+anv_shader_offline_spirv_options(struct vk_physical_device *device, mesa_shader_stage stage,
+                                 const struct vk_pipeline_robustness_state *rs)
+{
+   return anv_shader_get_spirv_options(device, stage, rs);
+}
+
+void
+anv_shader_offline_preprocess(struct vk_physical_device *device, nir_shader *nir,
+                              const struct vk_pipeline_robustness_state *rs)
+{
+   anv_shader_preprocess_nir(device, nir, rs);
+}
+
+void
+anv_shader_offline_populate_key(struct vk_physical_device *device,
+                                struct anv_shader_data *shader_data,
+                                const struct vk_graphics_pipeline_state *state,
+                                VkShaderStageFlags link_stages)
+{
+   const struct vk_pipeline_robustness_state *rs = shader_data->info->robustness;
+
+   switch (shader_data->info->stage) {
+   case MESA_SHADER_VERTEX:
+      populate_vs_prog_key(&shader_data->key.vs, device, rs, state, link_stages);
+      break;
+   case MESA_SHADER_TESS_CTRL:
+      populate_tcs_prog_key(&shader_data->key.tcs, device, rs, state, link_stages);
+      break;
+   case MESA_SHADER_TESS_EVAL:
+      populate_tes_prog_key(&shader_data->key.tes, device, rs, state, link_stages);
+      break;
+   case MESA_SHADER_GEOMETRY:
+      populate_gs_prog_key(&shader_data->key.gs, device, rs, state, link_stages);
+      break;
+   case MESA_SHADER_TASK:
+      populate_task_prog_key(&shader_data->key.task, device, rs, state, link_stages);
+      break;
+   case MESA_SHADER_MESH:
+      populate_mesh_prog_key(&shader_data->key.mesh, device, rs, state, link_stages);
+      break;
+   case MESA_SHADER_FRAGMENT:
+      populate_fs_prog_key(&shader_data->key.fs, device, rs, state, link_stages);
+      break;
+   case MESA_SHADER_COMPUTE:
+      populate_cs_prog_key(&shader_data->key.cs, device, rs);
+      break;
+   case MESA_SHADER_RAYGEN:
+   case MESA_SHADER_ANY_HIT:
+   case MESA_SHADER_CLOSEST_HIT:
+   case MESA_SHADER_MISS:
+   case MESA_SHADER_INTERSECTION:
+   case MESA_SHADER_CALLABLE:
+      populate_bs_prog_key(&shader_data->key.bs, device, rs, shader_data->info->rt_flags);
+      break;
+   default:
+      UNREACHABLE("Invalid stage");
+   }
+}
+
+void
+anv_shader_offline_finish(struct anv_device *device,
+                          struct anv_shader_data *shader_data,
+                          nir_shader *intersection_any_hit,
+                          union brw_any_compile_params *params,
+                          void *mem_ctx)
+{
+   nir_shader *nir = shader_data->info->nir;
+
+   anv_fixup_subgroup_size(device, shader_data);
+   anv_nir_apply_shader_workarounds(nir);
+
+   /* On Intel an intersection shader's any-hit runs inside it, so the two are merged; NULL is the
+    * hit group with no any-hit, where reportIntersection behaves as accept-always. */
+   if (nir->info.stage == MESA_SHADER_INTERSECTION)
+      brw_nir_lower_combined_intersection_any_hit(nir, intersection_any_hit, device->info);
+
+   if (mesa_shader_stage_is_rt(nir->info.stage))
+      anv_shaders_post_lower_rt(device, shader_data, 1);
+
+   switch (nir->info.stage) {
+   case MESA_SHADER_TESS_CTRL:
+      shader_data->key.tcs.outputs_written = nir->info.outputs_written;
+      shader_data->key.tcs.patch_outputs_written = nir->info.patch_outputs_written;
+      break;
+   case MESA_SHADER_TESS_EVAL:
+      populate_compile_params_tes(params, shader_data, NULL);
+      break;
+   case MESA_SHADER_MESH:
+      populate_compile_params_mesh(params, shader_data, NULL);
+      break;
+   case MESA_SHADER_FRAGMENT:
+      populate_compile_params_fs(params, shader_data, NULL);
+      break;
+   case MESA_SHADER_RAYGEN:
+   case MESA_SHADER_ANY_HIT:
+   case MESA_SHADER_CLOSEST_HIT:
+   case MESA_SHADER_MISS:
+   case MESA_SHADER_INTERSECTION:
+   case MESA_SHADER_CALLABLE:
+      populate_compile_params_bs(params, device->info, mem_ctx, shader_data);
+      break;
+   default:
+      break;
+   }
+}
+
+#endif /* ANV_SHADER_LOWER_NIR_ONLY */
+
+/*
+ * Everything above is a pure function of a physical device and a shader: the prog keys, the lowering,
+ * the linking helpers and the per-stage RT entry lowering. Compiling this file with
+ * ANV_SHADER_LOWER_NIR_ONLY stops here, so an offline compiler can drive all of it without the
+ * driver's orchestration below: the shader cache, the pipeline entrypoints and the archiver.
+ */
+#ifndef ANV_SHADER_LOWER_NIR_ONLY
 
 static VkShaderStageFlags
 anv_shader_get_rt_group_linking(struct vk_physical_device *device,

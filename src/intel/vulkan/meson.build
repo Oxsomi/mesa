@@ -141,7 +141,9 @@ if not with_intel_vk
 
   libanv_nir_lowering = static_library(
     'anv_nir_lowering',
-    files(
+    # the generated driconf source is compiled here with DEFAULTS_ONLY, so the built-in values are
+    # available without xmlconfig, which needs a POSIX directory scan
+    [libanv_drirc_files, files(
       # compiled a second time each, the way genX_*.c is compiled per generation: the layout
       # arithmetic and the shader lowering, with none of the driver that normally surrounds them
       'anv_descriptor_set.c',
@@ -164,11 +166,22 @@ if not with_intel_vk
       '../../vulkan/runtime/vk_nir_convert_ycbcr.c',
       # the SLM sizing the compute push layout needs
       '../common/intel_compute_slm.c',
-    ),
+      # the feature and extension tables (FEATURES_ONLY region), which feed the generated SPIR-V
+      # capability mapping below, so the front end accepts exactly what the target supports
+      'anv_physical_device.c',
+      # the runtime's SPIR-V front door: capabilities, then parse, then the finalization passes a
+      # driver-facing module has already had run on it
+      '../../vulkan/runtime/vk_nir.c',
+      '../../vulkan/util/vk_util.c',
+    ), vk_physical_device_spirv_caps],
     include_directories : anv_nir_lowering_incs,
-    c_args : anv_flags + ['-DANV_DESCRIPTOR_SET_LAYOUT_ONLY', '-DANV_SHADER_LOWER_NIR_ONLY'],
+    c_args : anv_flags + ['-DANV_DESCRIPTOR_SET_LAYOUT_ONLY', '-DANV_SHADER_LOWER_NIR_ONLY',
+                        '-DANV_DRIRC_DEFAULTS_ONLY', '-DANV_PHYSICAL_DEVICE_FEATURES_ONLY',
+                        # the feature tables must answer for ray tracing even though the
+                        # driver's RT runtime is not in this build
+                        '-UANV_SUPPORT_RT', '-DANV_SUPPORT_RT=1'],
     dependencies : [
-      idep_anv_headers, idep_anv_drirc, idep_vulkan_util_headers,
+      idep_anv_headers, idep_vulkan_util_headers,
       idep_vulkan_generated_headers, idep_genxml, idep_nir_headers,
       idep_mesautil, idep_intel_dev,
     ],
