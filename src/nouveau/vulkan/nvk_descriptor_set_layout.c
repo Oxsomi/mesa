@@ -142,6 +142,9 @@ nvk_descriptor_get_type_list(VkDescriptorType type,
    return type_list;
 }
 
+/* The destroy hook and the Vulkan entrypoint below allocate and upload through the device; the
+ * layout arithmetic between them does not, which is what the offline compiler builds against. */
+#ifndef NVK_SHADER_LOWER_NIR_ONLY
 static void
 nvk_descriptor_set_layout_destroy(struct vk_device *vk_dev,
                                   struct vk_descriptor_set_layout *vk_layout)
@@ -159,15 +162,14 @@ nvk_descriptor_set_layout_destroy(struct vk_device *vk_dev,
    vk_object_free(&dev->vk, NULL, layout);
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL
-nvk_CreateDescriptorSetLayout(VkDevice device,
-                              const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
-                              const VkAllocationCallbacks *pAllocator,
-                              VkDescriptorSetLayout *pSetLayout)
-{
-   VK_FROM_HANDLE(nvk_device, dev, device);
-   const struct nvk_physical_device *pdev = nvk_device_physical(dev);
+#endif /* NVK_SHADER_LOWER_NIR_ONLY */
 
+/* Sizes a layout allocation. A caller with no device needs both numbers before it can allocate. */
+void
+nvk_descriptor_set_layout_count(const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
+                                uint32_t *num_bindings_out,
+                                uint32_t *immutable_sampler_count_out)
+{
    uint32_t num_bindings = 0;
    uint32_t immutable_sampler_count = 0;
    for (uint32_t j = 0; j < pCreateInfo->bindingCount; j++) {
@@ -189,17 +191,23 @@ nvk_CreateDescriptorSetLayout(VkDevice device,
          immutable_sampler_count += binding->descriptorCount;
    }
 
-   VK_MULTIALLOC(ma);
-   VK_MULTIALLOC_DECL(&ma, struct nvk_descriptor_set_layout, layout, 1);
-   VK_MULTIALLOC_DECL(&ma, struct nvk_descriptor_set_binding_layout, bindings,
-                      num_bindings);
-   VK_MULTIALLOC_DECL(&ma, struct nvk_sampler *, samplers,
-                      immutable_sampler_count);
+   *num_bindings_out = num_bindings;
+   *immutable_sampler_count_out = immutable_sampler_count;
+}
 
-   if (!vk_descriptor_set_layout_multizalloc(&dev->vk, &ma, pCreateInfo))
-      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
-
-   layout->vk.destroy = nvk_descriptor_set_layout_destroy;
+/* Fills an already-allocated layout: the offsets, strides and sizes the NIR lowering reads back.
+ * A pure function of the create info and the physical device, which is why an offline compiler can
+ * call it instead of reimplementing these rules. Embedded immutable sampler data (the tail of
+ * nvk_CreateDescriptorSetLayout) is driver-side and not built here. */
+void
+nvk_descriptor_set_layout_init(const struct nvk_physical_device *pdev,
+                               const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
+                               struct nvk_descriptor_set_layout *layout,
+                               struct nvk_descriptor_set_binding_layout *bindings,
+                               struct nvk_sampler **samplers,
+                               uint32_t num_bindings,
+                               uint32_t immutable_sampler_count)
+{
    layout->flags = pCreateInfo->flags;
    layout->binding_count = num_bindings;
 
@@ -361,11 +369,41 @@ nvk_CreateDescriptorSetLayout(VkDevice device,
 #undef BLAKE3_UPDATE_VALUE
 
    _mesa_blake3_final(&blake3_ctx, layout->vk.blake3);
+}
+
+#ifndef NVK_SHADER_LOWER_NIR_ONLY
+
+VKAPI_ATTR VkResult VKAPI_CALL
+nvk_CreateDescriptorSetLayout(VkDevice device,
+                              const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
+                              const VkAllocationCallbacks *pAllocator,
+                              VkDescriptorSetLayout *pSetLayout)
+{
+   VK_FROM_HANDLE(nvk_device, dev, device);
+   const struct nvk_physical_device *pdev = nvk_device_physical(dev);
+
+   uint32_t num_bindings, immutable_sampler_count;
+   nvk_descriptor_set_layout_count(pCreateInfo, &num_bindings, &immutable_sampler_count);
+
+   VK_MULTIALLOC(ma);
+   VK_MULTIALLOC_DECL(&ma, struct nvk_descriptor_set_layout, layout, 1);
+   VK_MULTIALLOC_DECL(&ma, struct nvk_descriptor_set_binding_layout, bindings,
+                      num_bindings);
+   VK_MULTIALLOC_DECL(&ma, struct nvk_sampler *, samplers,
+                      immutable_sampler_count);
+
+   if (!vk_descriptor_set_layout_multizalloc(&dev->vk, &ma, pCreateInfo))
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   layout->vk.destroy = nvk_descriptor_set_layout_destroy;
+
+   nvk_descriptor_set_layout_init(pdev, pCreateInfo, layout, bindings, samplers,
+                                  num_bindings, immutable_sampler_count);
 
     if (pCreateInfo->flags &
         VK_DESCRIPTOR_SET_LAYOUT_CREATE_EMBEDDED_IMMUTABLE_SAMPLERS_BIT_EXT) {
       void *sampler_desc_data =
-         vk_alloc2(&dev->vk.alloc, pAllocator, buffer_size, 4,
+         vk_alloc2(&dev->vk.alloc, pAllocator, layout->non_variable_descriptor_buffer_size, 4,
                    VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
       if (sampler_desc_data == NULL) {
          nvk_descriptor_set_layout_destroy(&dev->vk, &layout->vk);
@@ -397,7 +435,7 @@ nvk_CreateDescriptorSetLayout(VkDevice device,
       }
 
       VkResult result = nvk_heap_upload(dev, &dev->shader_heap,
-                                        sampler_desc_data, buffer_size,
+                                        sampler_desc_data, layout->non_variable_descriptor_buffer_size,
                                         nvk_min_cbuf_alignment(&pdev->info),
                                         &layout->embedded_samplers_addr);
       vk_free2(&dev->vk.alloc, pAllocator, sampler_desc_data);
@@ -562,3 +600,5 @@ nvk_GetDescriptorSetLayoutBindingOffsetEXT(VkDevice device,
 
    *pOffset = layout->binding[binding].offset;
 }
+
+#endif /* NVK_SHADER_LOWER_NIR_ONLY */

@@ -312,7 +312,11 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
 #endif
       .GOOGLE_decorate_string = true,
 #ifdef NVK_USE_WSI_PLATFORM
+      /* A presentation extension with no bearing on any SPIR-V capability; the offline build has
+       * no WSI to ask, so it reports absent there. */
+#ifndef NVK_PHYSICAL_DEVICE_FEATURES_ONLY
       .GOOGLE_display_timing = wsi_instance_supports_google_display_timing(&instance->vk, &instance->drirc.options),
+#endif
 #endif
       .GOOGLE_hlsl_functionality1 = true,
       .GOOGLE_user_type = true,
@@ -1397,6 +1401,11 @@ nvk_get_device_properties(const struct nvk_instance *instance,
             "Mesa " PACKAGE_VERSION MESA_GIT_SHA1);
 }
 
+/* Everything above is a pure function of the instance and the device info: the extension, feature
+ * and property tables. Everything below talks to a kernel, a heap or a cache, so a build that
+ * only wants the tables (NVK_PHYSICAL_DEVICE_FEATURES_ONLY) stops here. */
+#ifndef NVK_PHYSICAL_DEVICE_FEATURES_ONLY
+
 static void
 nvk_physical_device_init_pipeline_cache(struct nvk_physical_device *pdev)
 {
@@ -2096,3 +2105,27 @@ nvk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(VkPhysicalDevice physicalDev
 
    return vk_outarray_status(&out);
 }
+
+#endif /* NVK_PHYSICAL_DEVICE_FEATURES_ONLY */
+
+#ifdef NVK_PHYSICAL_DEVICE_FEATURES_ONLY
+
+/* For the offline compiler (spirv2isa): the supported tables, filled by the same functions the driver
+ * fills them from, so the SPIR-V capability gate cannot drift from the driver's. All of them are
+ * pure functions of the device info and the instance, which is what makes this callable here. */
+void
+nvk_physical_device_offline_supported(const struct nvk_instance *instance,
+                                      const struct nv_device_info *info,
+                                      struct vk_device_extension_table *ext,
+                                      struct vk_features *features,
+                                      struct vk_properties *properties)
+{
+   nvk_get_device_extensions(instance, info, false /* has_tiled_bos */, ext);
+   nvk_get_device_features(info, ext, features);
+
+   /* The generated SPIR-V capability mapping gates the subgroup and float-controls capabilities on
+    * properties, so a zeroed table silently refuses every wave-op module the driver accepts. */
+   nvk_get_device_properties(instance, info, properties);
+}
+
+#endif /* NVK_PHYSICAL_DEVICE_FEATURES_ONLY */

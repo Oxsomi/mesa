@@ -332,6 +332,10 @@ nvk_image_max_dimension(const struct nv_device_info *info,
    }
 }
 
+/* Everything above is a pure function of the device info (the property tables read it);
+ * everything below is the driver's image machinery, which a lowering-only build stops before. */
+#ifndef NVK_SHADER_LOWER_NIR_ONLY
+
 static uint64_t
 get_explicit_drm_format_mod(const void *pNext)
 {
@@ -2058,3 +2062,5 @@ nvk_GetImageOpaqueCaptureDescriptorDataEXT(
 {
    return VK_SUCCESS;
 }
+
+#endif /* NVK_SHADER_LOWER_NIR_ONLY */

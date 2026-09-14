@@ -170,14 +170,15 @@ vk_format_info = custom_target(
   ],
 )
 
-# The generated headers above are all a device-free consumer needs from here: spirv2isa compiles
-# ANV's NIR lowering, which includes the runtime headers but links nothing out of the runtime.
+# The generated headers above are all the Intel spirv2isa backend needs from here (it compiles the
+# few runtime sources it uses itself); the NVIDIA backend links the runtime library, so its builds
+# continue below.
 idep_vulkan_generated_headers = declare_dependency(
   sources : [vk_cmd_queue[1], vk_physical_device_features[1], vk_physical_device_properties[1]],
   include_directories : include_directories('.'),
 )
 
-if not (with_any_vk or with_gallium_zink)
+if not (with_any_vk or with_gallium_zink or with_spirv2isa_nvidia)
   subdir_done()
 endif
 

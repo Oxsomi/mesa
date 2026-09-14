@@ -15,6 +15,8 @@
 #include "brw_cfg.h"
 #include "util/half_float.h"
 
+#include <string.h>                    /* memcmp, for the immediate comparator's total order */
+
 static const bool debug = false;
 
 enum ENUM_PACKED interpreted_type {
@@ -901,7 +903,18 @@ compare(const void *_a, const void *_b)
    if (end_diff)
       return end_diff;
 
-   return a->first_use_ip - b->first_use_ip;
+   int start_diff = a->first_use_ip - b->first_use_ip;
+   if (start_diff)
+      return start_diff;
+
+   /* Immediates can share a block and a live range, and qsort is not stable, so without a total order
+    * the surviving order is the C library's. Promotion below follows that order and its register
+    * assignment reaches the generated code, which then differs between a glibc build and a Windows
+    * one for the same shader. Comparing the payload keeps the order the program's own. */
+   if (a->size != b->size)
+      return a->size < b->size ? -1 : 1;
+
+   return memcmp(a->bytes, b->bytes, a->size);
 }
 
 static struct brw_reg

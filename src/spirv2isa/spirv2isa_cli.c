@@ -2,12 +2,14 @@
  * Copyright 2026 Oxsomi / Nielsbishere - SPDX-License-Identifier: MIT
  *
  * One CLI for every backend spirv2isa was built with. There is no vendor argument: a target names
- * its own vendor, so `list` prints them all and the compile paths take whichever number that printed.
+ * its own vendor. `list` prints the flagship tier; --verbose adds every enumerated device, and the
+ * compile paths take whichever token either printed.
  *
- *   spirv2isa-cli list
+ *   spirv2isa-cli list [--verbose]
  *   spirv2isa-cli <target> <stage> <shader.spv> <entry> [set:binding:type ...]
  *   spirv2isa-cli <target> rtpipe[-trav] <spv:stage:entry> ...
  */
+#include <stdbool.h>
 #include "spirv2isa.h"
 
 /* What this tool will index, not what the library supports: the set arrays below are on
@@ -24,10 +26,11 @@
 #define S2I_SPIRV_HEADER_WORDS 5
 
 /*
- * Nothing here is capped at a made up number. What a run can hold is already bounded by what it was
- * given: the library says how many targets it has, and argc bounds how many bindings or ray tracing
- * shaders the command line can name, so each is sized to exactly that. A fixed cap would silently
- * drop whatever came after it, which is the same failure as parsing an argument loosely.
+ * Beyond the set-array cap above, which refuses rather than truncates, nothing here is capped at a
+ * made up number. What a run can hold is already bounded by what it was given: the library says how
+ * many targets it has, and argc bounds how many bindings or ray tracing shaders the command line
+ * can name, so each is sized to exactly that. A cap that silently dropped whatever came after it
+ * would be the same failure as parsing an argument loosely.
  */
 
 /*
@@ -83,12 +86,15 @@ read_spirv(const char *path, size_t *out_words)
    return b;
 }
 
-/* Targets print by the token they are named by, which is what the compile paths take back. */
+/* Targets print by the token they are named by, which is what the compile paths take back. The
+ * default listing is the flagship tier; --verbose adds the extended tier, and the default says how
+ * many targets that hides rather than hiding them silently. */
 static void
-print_targets(FILE *out)
+print_targets(FILE *out, int verbose)
 {
    const size_t count = s2i_targets(NULL, 0);
    s2i_target *targets = (s2i_target *)malloc(count * sizeof(*targets));
+   size_t hidden = 0;
 
    if (!targets) {
       fprintf(out, "   (out of memory listing targets)\n");
@@ -102,10 +108,19 @@ print_targets(FILE *out)
       const s2i_vendor vendor = S2I_TARGET_VENDOR_OF(targets[i]);
       const int built = s2i_has_vendor(vendor);
 
-      fprintf(out, "   %-8s %-6s %s%s\n", s2i_target_id(targets[i]), s2i_vendor_name(vendor),
+      if (!verbose && !s2i_target_is_flagship(targets[i])) {
+         hidden++;
+         continue;
+      }
+
+      fprintf(out, "   %-10s %-6s %s%s\n", s2i_target_id(targets[i]), s2i_vendor_name(vendor),
               built ? s2i_target_name(targets[i]) : "",
               built ? "" : "(backend not built into this library)");
    }
+
+   if (hidden)
+      fprintf(out, "   (+%zu more; `list --verbose` names every device the built backends can model)\n",
+              hidden);
 
    free(targets);
 }
@@ -133,7 +148,7 @@ parse_target(const char *arg, s2i_target *out)
 
    if (!target) {
       fprintf(stderr, "unknown target '%s'\n", arg);
-      print_targets(stderr);
+      print_targets(stderr, 0);
       return 0;
    }
 
@@ -184,20 +199,34 @@ parse_u32(const char *arg, uint32_t *out)
 }
 
 static void
-print_stats(FILE *out, const s2i_stats *stats)
+print_stats(FILE *out, const char *prefix, const s2i_stats *stats)
 {
-   fprintf(out, "code %u B  scratch %u B  shared %u B\n", stats->code_size, stats->scratch_size,
-           stats->shared_size);
+   fprintf(out, "%scode %u B  scratch %u B  shared %u B\n", prefix, stats->code_size,
+           stats->scratch_size, stats->shared_size);
 
    switch (stats->vendor) {
 
    case S2I_VENDOR_AMD:
-      fprintf(out, "SGPRs %u  VGPRs %u  spilled %u/%u  instrs %u\n", stats->amd.sgprs, stats->amd.vgprs,
-              stats->amd.spilled_sgprs, stats->amd.spilled_vgprs, stats->amd.instructions);
+      fprintf(out, "%sSGPRs %u  VGPRs %u  spilled %u/%u  instrs %u  wave %u\n", prefix,
+              stats->amd.sgprs, stats->amd.vgprs, stats->amd.spilled_sgprs,
+              stats->amd.spilled_vgprs,
+              stats->amd.instructions, stats->amd.wave_size);
       break;
 
    case S2I_VENDOR_INTEL:
-      fprintf(out, "GRFs %u  SIMD %u\n", stats->intel.grf_used, stats->intel.simd_width);
+      fprintf(out, "%sGRFs %u  SIMD %u  instrs %u  cycles %u  spills %u/%u  sends %u  loops %u  "
+                   "peak regs %u\n",
+              prefix, stats->intel.grf_used, stats->intel.simd_width, stats->intel.instrs,
+              stats->intel.cycles, stats->intel.spills, stats->intel.fills, stats->intel.sends,
+              stats->intel.loops, stats->intel.max_live_registers);
+      break;
+
+   case S2I_VENDOR_NVIDIA:
+      fprintf(out, "%sGPRs %u  instrs %u  cycles %llu  spills %u/%u  warps/SM %u\n",
+              prefix, stats->nvidia.gprs, stats->nvidia.instrs,
+              (unsigned long long)stats->nvidia.static_cycles,
+              stats->nvidia.spills_to_mem, stats->nvidia.spills_to_reg,
+              stats->nvidia.max_warps_per_sm);
       break;
 
    default:
@@ -271,12 +300,11 @@ run_rt_pipeline(int argc, char **argv, s2i_target target, int compile_traversal)
 
    char *isa = NULL, *msg = NULL;
    s2i_stats stats = {0};
-   const char *rt_ext_env = getenv("S2I_FEATURES");
+
+   const s2i_pipeline pipeline = { .target = target };
 
    s2i_result r =
-      s2i_compile_rt_pipeline(shaders, n, 0, compile_traversal, target, NULL, 0,
-                              rt_ext_env ? (s2i_features)strtoul(rt_ext_env, NULL, 0) : 0,
-                              &isa, &stats, &msg);
+      s2i_compile_rt_pipeline(shaders, n, 0, compile_traversal, &pipeline, &isa, &stats, &msg);
 
    fprintf(stderr, "%s %s (%zu shaders) -> result %d\n", compile_traversal ? "rtpipe-trav" : "rtpipe",
            s2i_target_name(target), n, (int)r);
@@ -285,14 +313,21 @@ run_rt_pipeline(int argc, char **argv, s2i_target target, int compile_traversal)
 
    if (r == S2I_OK) {
 
+      /* The stats lead the artifact on stdout as comment lines, so a captured output carries its
+       * register/size facts the way a golden should, and names the target that produced it (by the
+       * token, which is what a caller passes back) so a snapshot filed under the wrong device is
+       * visible in the file and not only in its path; stderr keeps the bare human copy. */
+      printf("; target %s\n", s2i_target_id(target));
+      print_stats(stdout, "; ", &stats);
+
       if (isa)
          printf("%s\n", isa);
 
-      print_stats(stderr, &stats);
+      print_stats(stderr, "", &stats);
       free(isa);
    }
 
-   status = r == S2I_OK ? 0 : 1;
+   status = (int)r;
 
 cleanup:
 
@@ -311,8 +346,14 @@ int
 main(int argc, char **argv)
 {
    if (argc >= 2 && strcmp(argv[1], "list") == 0) {
+
+      if (argc > 3 || (argc == 3 && strcmp(argv[2], "--verbose") != 0)) {
+         fprintf(stderr, "usage: %s list [--verbose]\n", argv[0]);
+         return 2;
+      }
+
       printf("targets:\n");
-      print_targets(stdout);
+      print_targets(stdout, argc == 3);
       return 0;
    }
 
@@ -332,11 +373,15 @@ main(int argc, char **argv)
    }
 
    if (argc < 5) {
-      fprintf(stderr, "usage: %s <target> <stage> <shader.spv> <entry> [set:binding:type ...]\n", argv[0]);
+      fprintf(stderr, "usage: %s <target> <stage> <shader.spv> <entry> [set:binding:type ...]\n"
+                      "       [gfx:<key>=<value> ...]\n", argv[0]);
+      fprintf(stderr, "gfx keys: stages=vs,hs,ds,gs,ps,task,mesh (whole pipeline, default vs,ps)\n"
+                      "          samples=N  sample-shading=0|1  alpha-to-coverage=0|1\n"
+                      "          view-mask=N  patch-points=N\n");
       fprintf(stderr, "       %s <target> rtpipe[-trav] <spv:stage:entry> ...\n", argv[0]);
-      fprintf(stderr, "       %s list\n", argv[0]);
+      fprintf(stderr, "       %s list [--verbose]\n", argv[0]);
       fprintf(stderr, "targets:\n");
-      print_targets(stderr);
+      print_targets(stderr, 0);
       print_stages(stderr);
       fprintf(stderr, "\nS2I_NO_CAPTURE=1 leaves stderr alone: no disassembly is returned, but a backend\n"
                       "that dies inside the compiler says why instead of exiting silently.\n");
@@ -350,6 +395,83 @@ main(int argc, char **argv)
       return 2;
 
    const char *entry = argv[4];
+
+   /* Optional "gfx:<key>=<value>" args declare the graphics pipeline this stage belongs to, which
+    * is what the library keys the graphics stages from. The stage list is the whole pipeline's,
+    * not just the one being compiled, so leaving the vertex stage out is refused by the library. */
+
+   bool gfx_declared = false;
+   uint32_t gfx_samples = 1, gfx_view_mask = 0, gfx_patch_points = 0;
+   VkBool32 gfx_alpha_to_coverage = VK_FALSE, gfx_sample_shading = VK_FALSE;
+   VkShaderStageFlags gfx_stage_mask = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+
+   for (int i = 5; i < argc; i++) {
+
+      if (strncmp(argv[i], "gfx:", 4))
+         continue;
+
+      char key[32], value[96];
+
+      if (sscanf(argv[i] + 4, "%31[^=]=%95s", key, value) != 2) {
+         fprintf(stderr, "bad graphics option '%s' (want gfx:<key>=<value>)\n", argv[i]);
+         return 2;
+      }
+
+      gfx_declared = true;
+      uint32_t number = 0;
+
+      if (!strcmp(key, "stages")) {
+
+         static const struct { const char *name; VkShaderStageFlagBits bit; } names[] = {
+            { "vs", VK_SHADER_STAGE_VERTEX_BIT },
+            { "hs", VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT },
+            { "ds", VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT },
+            { "gs", VK_SHADER_STAGE_GEOMETRY_BIT },
+            { "ps", VK_SHADER_STAGE_FRAGMENT_BIT },
+            { "task", VK_SHADER_STAGE_TASK_BIT_EXT },
+            { "mesh", VK_SHADER_STAGE_MESH_BIT_EXT },
+         };
+
+         gfx_stage_mask = 0;
+
+         for (const char *at = value; *at; ) {
+
+            const char *end = strchr(at, ',');
+            const size_t len = end ? (size_t)(end - at) : strlen(at);
+            VkShaderStageFlags found = 0;
+
+            for (size_t n = 0; n < sizeof(names) / sizeof(names[0]); n++) {
+               if (strlen(names[n].name) == len && !strncmp(at, names[n].name, len))
+                  found = names[n].bit;
+            }
+
+            if (!found) {
+               fprintf(stderr, "gfx:stages names no stage '%.*s'\n", (int)len, at);
+               return 2;
+            }
+
+            gfx_stage_mask |= found;
+            at = end ? end + 1 : at + len;
+         }
+
+      } else if (!parse_u32(value, &number)) {
+         fprintf(stderr, "graphics option '%s' wants a number\n", key);
+         return 2;
+      } else if (!strcmp(key, "samples")) {
+         gfx_samples = number;
+      } else if (!strcmp(key, "view-mask")) {
+         gfx_view_mask = number;
+      } else if (!strcmp(key, "patch-points")) {
+         gfx_patch_points = number;
+      } else if (!strcmp(key, "alpha-to-coverage")) {
+         gfx_alpha_to_coverage = number ? VK_TRUE : VK_FALSE;
+      } else if (!strcmp(key, "sample-shading")) {
+         gfx_sample_shading = number ? VK_TRUE : VK_FALSE;
+      } else {
+         fprintf(stderr, "unknown graphics option '%s'\n", key);
+         return 2;
+      }
+   }
 
    /* Optional trailing args are descriptor bindings "set:binding:type", where type is a
     * VkDescriptorType, so the CLI exercises the same layout path a caller uses. They are collected
@@ -374,6 +496,9 @@ main(int argc, char **argv)
    uint32_t binding_count = 0, highest_set = 0;
 
    for (int i = 5; i < argc; i++) {
+
+      if (!strncmp(argv[i], "gfx:", 4))
+         continue;
 
       char setId[32], bindId[32], typeId[32];
       uint32_t set = 0, bind = 0, type = 0;
@@ -471,24 +596,138 @@ main(int argc, char **argv)
    s2i_stats stats = {0};
    s2i_info info = {0};
 
-   /* The CLI has no oiSH, so it leans on the defensive SPIR-V scan; S2I_FEATURES=<hex> can declare an
-    * s2i_feature set to exercise the primary gate (the corpus sweep translates the oiSH into one). */
 
-   const char *ext_env = getenv("S2I_FEATURES");
-   s2i_features features_used = ext_env ? (s2i_features)strtoul(ext_env, NULL, 0) : 0;
 
-   s2i_result r = s2i_compile(spirv, words, entry, stage, target,
-                              set_layout_count ? set_layouts : NULL, set_layout_count,
-                              features_used, &isa, &stats, &info, &msg);
+   VkPipelineShaderStageCreateInfo gfx_stage_infos[7];
+   uint32_t gfx_stage_count = 0;
+
+   static const VkShaderStageFlagBits gfx_stage_bits[] = {
+      VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
+      VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, VK_SHADER_STAGE_GEOMETRY_BIT,
+      VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_TASK_BIT_EXT, VK_SHADER_STAGE_MESH_BIT_EXT,
+   };
+
+   for (size_t i = 0; i < sizeof(gfx_stage_bits) / sizeof(gfx_stage_bits[0]); i++) {
+
+      if (!(gfx_stage_mask & gfx_stage_bits[i]))
+         continue;
+
+      gfx_stage_infos[gfx_stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+      gfx_stage_infos[gfx_stage_count].pNext = NULL;
+      gfx_stage_infos[gfx_stage_count].flags = 0;
+      gfx_stage_infos[gfx_stage_count].stage = gfx_stage_bits[i];
+      gfx_stage_infos[gfx_stage_count].module = VK_NULL_HANDLE;
+      gfx_stage_infos[gfx_stage_count].pName = entry;
+      gfx_stage_infos[gfx_stage_count].pSpecializationInfo = NULL;
+      gfx_stage_count++;
+   }
+
+   const VkFormat gfx_color_format = VK_FORMAT_R8G8B8A8_UNORM;
+
+   const VkPipelineRenderingCreateInfo gfx_rendering = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+      .viewMask = gfx_view_mask,
+      .colorAttachmentCount = 1,
+      .pColorAttachmentFormats = &gfx_color_format,
+   };
+
+   const VkPipelineMultisampleStateCreateInfo gfx_ms = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+      .rasterizationSamples = (VkSampleCountFlagBits)(gfx_samples ? gfx_samples : 1),
+      .sampleShadingEnable = gfx_sample_shading,
+      .minSampleShading = gfx_sample_shading ? 1.0f : 0.0f,
+      .alphaToCoverageEnable = gfx_alpha_to_coverage,
+   };
+
+   const VkPipelineTessellationStateCreateInfo gfx_ts = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO,
+      .patchControlPoints = gfx_patch_points,
+   };
+
+   /* The fill reads these even when nothing about them is declared (rasterizer discard decides
+    * whether the pipeline has rasterization at all), so a create info without them is dereferenced
+    * through a null pointer inside the runtime. */
+   const VkPipelineVertexInputStateCreateInfo gfx_vi = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+   };
+
+   const VkPipelineInputAssemblyStateCreateInfo gfx_ia = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+      .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+   };
+
+   const VkPipelineViewportStateCreateInfo gfx_vp = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+      .viewportCount = 1,
+      .scissorCount = 1,
+   };
+
+   const VkPipelineRasterizationStateCreateInfo gfx_rs = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+      .polygonMode = VK_POLYGON_MODE_FILL,
+      .cullMode = VK_CULL_MODE_NONE,
+      .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+      .lineWidth = 1.0f,
+   };
+
+   const VkPipelineDepthStencilStateCreateInfo gfx_ds = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+   };
+
+   const VkPipelineColorBlendAttachmentState gfx_cb_attachment = {
+      .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+   };
+
+   const VkPipelineColorBlendStateCreateInfo gfx_cb = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+      .attachmentCount = 1,
+      .pAttachments = &gfx_cb_attachment,
+   };
+
+   const VkGraphicsPipelineCreateInfo gfx_ci = {
+      .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+      .pNext = &gfx_rendering,
+      .stageCount = gfx_stage_count,
+      .pStages = gfx_stage_infos,
+      .pVertexInputState = &gfx_vi,
+      .pInputAssemblyState = &gfx_ia,
+      .pViewportState = &gfx_vp,
+      .pRasterizationState = &gfx_rs,
+      .pMultisampleState = &gfx_ms,
+      .pDepthStencilState = &gfx_ds,
+      .pColorBlendState = &gfx_cb,
+      .pTessellationState = gfx_patch_points ? &gfx_ts : NULL,
+   };
+
+   const s2i_pipeline pipeline = {
+      .target = target,
+      .set_layouts = set_layout_count ? set_layouts : NULL,
+      .set_layout_count = set_layout_count,
+      .graphics = gfx_declared ? &gfx_ci : NULL,
+   };
+
+   s2i_result r = s2i_compile(spirv, words, entry, stage, &pipeline, &isa, &stats, &info, &msg);
 
    fprintf(stderr, "target: %s -> result %d\n", s2i_target_name(target), (int)r);
 
    if (msg) { fprintf(stderr, "message: %s\n", msg); free(msg); }
 
+   if (info.notes) {
+      fprintf(stderr, "notes:\n%s", info.notes);
+      free(info.notes);
+      info.notes = NULL;
+   }
+
    if (r == S2I_OK) {
 
+      printf("; target %s\n", s2i_target_id(target));
+      print_stats(stdout, "; ", &stats);
       printf("%s\n", isa ? isa : "(no isa)");
-      print_stats(stderr, &stats);
+      print_stats(stderr, "", &stats);
+
+      if (info.graphics_specialized)
+         fprintf(stderr, "graphics: pipeline state applied\n");
 
       if (info.rt_mode != S2I_RT_MODE_NA) {
 
@@ -508,5 +747,6 @@ main(int argc, char **argv)
    free(all_bindings);
       free(binding_sets);
       free(sorted);
-   return r == S2I_OK ? 0 : 1;
+   /* The exit code is the s2i_result itself, so a spawning caller can tell the refusal kinds apart. */
+   return (int)r;
 }

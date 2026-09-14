@@ -2271,9 +2271,14 @@ build_device_bindable_binding_table(struct apply_pipeline_layout_state *state,
                                                  struct anv_pipeline_binding,
                                                  push_block_count);
 
-   memcpy(push_map->block_to_descriptor,
-          map->surface_to_descriptor,
-          sizeof(push_map->block_to_descriptor[0]) * map->surface_count);
+   /* A bindless stage has no surface table at all, and memcpy from NULL is undefined even for zero
+    * bytes. */
+   if (map->surface_count) {
+      memcpy(push_map->block_to_descriptor,
+             map->surface_to_descriptor,
+             sizeof(push_map->block_to_descriptor[0]) * map->surface_count);
+   }
+
    push_map->block_count = map->surface_count;
 
    /* No BTI allowed for descriptor sets, we'll use A64 messages. */
@@ -2375,9 +2380,14 @@ build_packed_binding_table(struct apply_pipeline_layout_state *state,
                                                  struct anv_pipeline_binding,
                                                  push_block_count);
 
-   memcpy(push_map->block_to_descriptor,
-          map->surface_to_descriptor,
-          sizeof(push_map->block_to_descriptor[0]) * map->surface_count);
+   /* A bindless stage has no surface table at all, and memcpy from NULL is undefined even for zero
+    * bytes. */
+   if (map->surface_count) {
+      memcpy(push_map->block_to_descriptor,
+             map->surface_to_descriptor,
+             sizeof(push_map->block_to_descriptor[0]) * map->surface_count);
+   }
+
    push_map->block_count = map->surface_count;
 
    /* Assign a BTI to each used descriptor set */

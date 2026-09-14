@@ -97,4 +97,13 @@ VkExtent2D nvk_max_shading_rate(const struct nvk_physical_device *pdev,
 #define NVK_USE_WSI_PLATFORM
 #endif
 
+#ifdef NVK_PHYSICAL_DEVICE_FEATURES_ONLY
+/* nvk_physical_device.c's feature-table wrapper for the offline compiler; see the guard there. */
+void nvk_physical_device_offline_supported(const struct nvk_instance *instance,
+                                           const struct nv_device_info *info,
+                                           struct vk_device_extension_table *ext,
+                                           struct vk_features *features,
+                                           struct vk_properties *properties);
+#endif
+
 #endif

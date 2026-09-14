@@ -210,6 +210,9 @@ struct radv_physical_device {
 
 VK_DEFINE_HANDLE_CASTS(radv_physical_device, vk.base, VkPhysicalDevice, VK_OBJECT_TYPE_PHYSICAL_DEVICE)
 
+/* Fills the supported tables of a physical device with no device behind it, for spirv2isa. */
+void radv_physical_device_offline_supported(struct radv_physical_device *pdev);
+
 bool radv_sparse_enabled(const struct radv_physical_device *pdev);
 
 static inline struct radv_instance *

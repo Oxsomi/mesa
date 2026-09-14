@@ -106,4 +106,12 @@ nv_device_uuid(const struct nv_device_info *info, uint8_t *uuid, size_t len, boo
    uuid[11] = vm_bind;
 }
 
+/* The fields that follow from the chipset alone: the shader model, its occupancy limit, the SMs per TPC
+ * and the shared memory ladder are properties of the chip, so a caller with no device to ask still gets
+ * them right instead of transcribing them. The unit counts and the class numbers are what a device
+ * reports, so they stay the caller's to fill.
+ * Defined in the winsys, beside the ladders device creation already runs.
+ */
+void nv_device_info_from_chipset(struct nv_device_info *info, uint16_t chipset);
+
 #endif /* NV_DEVINFO_H */

@@ -279,7 +279,7 @@ endif
 # device-free radv_* compile functions (radv_get_nir_options / radv_declare_shader_args /
 # radv_postprocess_nir) directly. Gated, never present in a normal build.
 radv_spirv2isa_incs = []
-if get_option('spirv2isa')
+if with_spirv2isa_amd
   libradv_files += files('../spirv2isa/spirv2isa_amd.c')
   # it is compiled here, so it needs the public spirv2isa headers here; the dependency the backend
   # declares is for whoever links it, and does not reach this compile

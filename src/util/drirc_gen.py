@@ -84,6 +84,12 @@ class DrircOption(object):
         """The default as a C literal, or None for options with no literal form."""
         value = getattr(self, "value", None)
 
+        if self.dtype in (DrircOptionType.STRING, DrircOptionType.STRING_NODEF):
+            # The parser returns owned storage; the defaults point at literals, which no caller may
+            # free, and never at NULL, which strlen'ing consumers do not expect.
+            escaped = str(value).replace("\\", "\\\\").replace('"', '\\"') if value else ""
+            return f'"{escaped}"'
+
         if value is None:
             return None
 
@@ -99,7 +105,7 @@ class DrircOption(object):
         if self.dtype == DrircOptionType.INT:
             return str(int(value))
 
-        # enums carry a name, and strings need storage, so neither has a literal worth emitting
+        # enums carry a name with no literal form
         return None
 
 class DrircBool(DrircOption):

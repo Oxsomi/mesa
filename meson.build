@@ -614,6 +614,18 @@ foreach platform : _platforms
   pre_args += '-DHAVE_@0@_PLATFORM'.format(platform.to_upper())
 endforeach
 
+# MinGW defaults to the MS bitfield layout, which starts a new allocation unit whenever a bitfield's
+# declared type changes size. Mesa's structs mix bitfield types, so that layout repacks them, and code
+# that compares or hashes such a struct by its bytes then behaves differently from every other target:
+# the Intel compiler folds two distinct register references together and drops a payload read, which is
+# a miscompile, not a size difference. The Itanium layout every other target uses is a correctness
+# requirement here, not a preference, so it is set for the whole project rather than per consumer.
+# It also relayouts any bitfield struct shared with the Windows API, so a component handing such a
+# struct to Win32 needs the per-struct gcc_struct attribute instead of relying on this.
+if host_machine.system() == 'windows' and cc.get_argument_syntax() != 'msvc'
+  c_cpp_args += '-mno-ms-bitfields'
+endif
+
 if with_platform_android and get_option('platform-sdk-version') >= 29
   # By default the NDK compiler, at least, emits emutls references instead of
   # ELF TLS, even when building targeting newer API levels.  Make it actually do
@@ -862,7 +874,21 @@ if with_gallium_rusticl
 endif
 
 with_virtgpu_kumquat = get_option('virtgpu_kumquat') and with_gfxstream_vk
-if with_gallium_rusticl or with_nouveau_vk or with_tools.contains('etnaviv') or with_virtgpu_kumquat or with_panfrost_rust
+# spirv2isa options are read here, above their natural home below, because the rust gate
+# next needs the nvidia one.
+with_spirv2isa = get_option('spirv2isa')
+with_spirv2isa_amd = with_spirv2isa and get_option('spirv2isa-backends').contains('amd')
+with_spirv2isa_intel = with_spirv2isa and get_option('spirv2isa-backends').contains('intel')
+with_spirv2isa_nvidia = with_spirv2isa and get_option('spirv2isa-backends').contains('nvidia')
+
+# The amd backend is compiled into RADV rather than carved out of it, so it cannot be built without
+# that driver. Say so here: without this the build dies much later on an unrelated missing variable.
+if with_spirv2isa_amd and not with_amd_vk
+  error('the amd spirv2isa backend is compiled into RADV, so it needs amd in -Dvulkan-drivers. ' +
+        'Either add it there, or drop amd from -Dspirv2isa-backends.')
+endif
+
+if with_gallium_rusticl or with_nouveau_vk or with_spirv2isa_nvidia or with_tools.contains('etnaviv') or with_virtgpu_kumquat or with_panfrost_rust
   # rust.bindgen() does not pass `--rust-target` to bindgen until 1.7.0.
   if meson.version().version_compare('< 1.7.0')
     error('Mesa Rust support requires Meson 1.7.0 or newer')
@@ -985,12 +1011,6 @@ if with_clc
   dep_clc = dependency('libclc')
 endif
 
-# spirv2isa: which backends this build wants. It drives nir/vtn directly, so it counts as a compute
-# consumer below; without that nir builds as its headers only stub and nothing can link it.
-
-with_spirv2isa = get_option('spirv2isa')
-with_spirv2isa_amd = with_spirv2isa and get_option('spirv2isa-backends').contains('amd')
-with_spirv2isa_intel = with_spirv2isa and get_option('spirv2isa-backends').contains('intel')
 
 with_gfx_compute = [
   with_any_opengl,

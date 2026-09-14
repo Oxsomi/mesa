@@ -99,7 +99,10 @@ nvk_entrypoints = custom_target(
   depend_files : vk_entrypoints_gen_depend_files,
 )
 
-nvkcl_spv = custom_target(
+# The driver's internal shaders, compiled through CLC; only the driver library below the
+# spirv2isa stop consumes them, and a lowering-only build has no mesa_clc to build them with.
+if with_nouveau_vk
+  nvkcl_spv = custom_target(
   input : [nvkcl_files, libnvidia_headers],
   output : 'nvkcl.spv',
   command : [
@@ -120,6 +123,7 @@ nvkcl = custom_target(
   output : ['nvkcl.cpp', 'nvkcl.h'],
   command : [prog_vtn_bindgen2, '@INPUT@', '@OUTPUT@'],
 )
+endif
 
 nvk_drirc = custom_target(
   'nvk_drirc',
@@ -133,6 +137,60 @@ nvk_drirc = custom_target(
     '--validate', '@INPUT2@',
   ],
 )
+
+# spirv2isa compiles shaders with no device, and reuses NVK's own layout arithmetic and NIR lowering
+# rather than maintaining a second copy of rules that would drift. It needs the generated headers
+# above and the guarded rebuilds below; it needs none of the driver, so a build without the driver
+# stops here.
+if with_spirv2isa_nvidia
+  libnvk_nir_lowering = static_library(
+    'nvk_nir_lowering',
+    [
+      nvk_entrypoints[0],
+      nvk_drirc,
+      sha1_h,
+      files(
+        'nvk_shader.c',
+        'nvk_descriptor_set_layout.c',
+        'nvk_nir_lower_descriptors.c',
+        'nvk_nir_lower_mesh_shader.c',
+        'nvk_physical_device.c',
+        # only nvk_image_max_dimension, which the property table reads
+        'nvk_image.c',
+        # wholly a pure function of features and NIL format queries
+        'nvk_format.c',
+        # only nvk_get_buffer_format_features, for the property table
+        'nvk_buffer_view.c',
+      ),
+    ],
+    include_directories : [inc_include, inc_src],
+    c_args : [
+      '-DNVK_SHADER_LOWER_NIR_ONLY', '-DNVK_PHYSICAL_DEVICE_FEATURES_ONLY',
+      '-DNVK_DRIRC_DEFAULTS_ONLY',
+    ],
+    dependencies : [
+      dep_libdrm,
+      idep_nak, idep_nil, idep_nir, idep_mesautil,
+      idep_nouveau_ws, idep_nvidia_headers, idep_nouveau_mme, idep_nouveau_cubin,
+      idep_vulkan_runtime, idep_vulkan_util, idep_vulkan_wsi_headers,
+    ],
+    build_by_default : false,
+  )
+
+  idep_nvk_nir_lowering = declare_dependency(
+    link_with : libnvk_nir_lowering,
+    include_directories : include_directories('.'),
+    dependencies : [
+      idep_nak, idep_nil, idep_nvidia_headers,
+      idep_vulkan_runtime, idep_vulkan_util,
+    ],
+    sources : [nvk_entrypoints[0], nvk_drirc[1]],
+  )
+endif
+
+if not with_nouveau_vk
+  subdir_done()
+endif
 
 nvk_deps = [
   dep_libdrm,

@@ -88,4 +88,21 @@ vk_to_nvk_descriptor_set_layout(struct vk_descriptor_set_layout *layout)
    return container_of(layout, struct nvk_descriptor_set_layout, vk);
 }
 
+/* The layout arithmetic in nvk_descriptor_set_layout.c, callable without a device; see the split
+ * there. */
+
+void
+nvk_descriptor_set_layout_count(const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
+                                uint32_t *num_bindings_out,
+                                uint32_t *immutable_sampler_count_out);
+
+void
+nvk_descriptor_set_layout_init(const struct nvk_physical_device *pdev,
+                               const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
+                               struct nvk_descriptor_set_layout *layout,
+                               struct nvk_descriptor_set_binding_layout *bindings,
+                               struct nvk_sampler **samplers,
+                               uint32_t num_bindings,
+                               uint32_t immutable_sampler_count);
+
 #endif

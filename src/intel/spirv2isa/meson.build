@@ -28,11 +28,19 @@ spirv2isa_intel_incs = [
   inc_include, inc_src, inc_intel, inc_intel_compiler,
 ]
 
+spirv2isa_intel_args = ['-DANV_SHADER_LOWER_NIR_ONLY', '-DANV_PHYSICAL_DEVICE_FEATURES_ONLY']
+
+# The NVIDIA backend links mesa's real Vulkan runtime into the same dispatcher library; the Intel
+# stand-ins for its symbols must give way there or the link sees them twice.
+if with_spirv2isa_nvidia
+  spirv2isa_intel_args += '-DS2I_SHARED_VK_RUNTIME'
+endif
+
 libspirv2isa_intel = static_library(
   'spirv2isa_intel',
   files('spirv2isa_intel.c', 'spirv2isa_intel_anv.c'),
   include_directories : spirv2isa_intel_incs,
-  c_args : ['-DANV_SHADER_LOWER_NIR_ONLY', '-DANV_PHYSICAL_DEVICE_FEATURES_ONLY'],
+  c_args : spirv2isa_intel_args,
   dependencies : spirv2isa_intel_deps,
   build_by_default : false,
 )

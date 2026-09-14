@@ -25,14 +25,22 @@ extern "C" {
 /* s2i_compile for an Intel target, taking Intel's own stats. See s2i_compile for the arguments.
  * `bindings` is the layout every resource is placed from, so a module that uses a descriptor the
  * caller did not describe cannot be compiled. */
-s2i_result s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2i_stage stage,
-                             int target_index, const VkDescriptorSetLayoutCreateInfo *const *set_layouts,
-                             uint32_t set_layout_count,
-                             s2i_features features_used, char **isa_text, s2i_stats_intel *stats,
-                             s2i_info *info, char **message);
+s2i_result s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry,
+                             s2i_stage stage, int target_index, const s2i_pipeline *pipeline,
+                             char **isa_text, s2i_stats_intel *stats, s2i_info *info,
+                             char **message);
 
 /* Human-readable name of an Intel target, "" when the index isn't one. */
 const char *s2i_intel_target_name(int target_index);
+
+/* Total targets across both tiers, flagships first: the enum's constants, then every other Gen9+
+ * PCI id Mesa's device database knows (minus preproduction force-probe ids), enumerated at
+ * runtime. */
+int s2i_intel_target_count(void);
+
+/* Token of an extended-tier target, "" for a flagship index (whose token the dispatcher owns) and
+ * for out of range. */
+const char *s2i_intel_target_token(int target_index);
 
 #ifdef __cplusplus
 }

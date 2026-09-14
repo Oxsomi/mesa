@@ -84,11 +84,12 @@ idep_vulkan_wsi_defines = declare_dependency(
 vulkan_wsi_deps += idep_vulkan_wsi_defines
 
 # util holds the generated headers (vk_dispatch_table, vk_extensions, the enum and feature tables),
-# which spirv2isa needs to compile ANV's NIR lowering. Everything below it belongs to a driver, so a
-# spirv2isa-only build stops here.
+# which spirv2isa needs to compile a driver's NIR lowering. The runtime follows for its own
+# generated headers, and stays linked for the NVIDIA backend, whose build therefore continues
+# below (wsi included); the layers belong to real drivers only.
 subdir('util')
 subdir('runtime')
-if not (with_any_vk or with_gallium_zink)
+if not (with_any_vk or with_gallium_zink or with_spirv2isa_nvidia)
   subdir_done()
 endif
 subdir('wsi')

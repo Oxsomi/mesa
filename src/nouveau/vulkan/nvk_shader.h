@@ -170,4 +170,34 @@ nvk_compile_nir_shader(struct nvk_device *dev, nir_shader *nir,
 uint32_t mesa_to_nv9097_shader_type(mesa_shader_stage stage, bool has_task_shader);
 uint32_t nvk_pipeline_bind_group(mesa_shader_stage stage, bool has_task_shader);
 
+#ifdef NVK_SHADER_LOWER_NIR_ONLY
+/* The offline entry points at the end of nvk_shader.c's device-free region. */
+
+struct nvk_cbuf_map;
+struct vk_pipeline_robustness_state;
+
+const struct nir_shader_compiler_options *
+nvk_shader_offline_nir_options(struct vk_physical_device *device, mesa_shader_stage stage,
+                               const struct vk_pipeline_robustness_state *rs);
+
+struct spirv_to_nir_options
+nvk_shader_offline_spirv_options(struct vk_physical_device *device, mesa_shader_stage stage,
+                                 const struct vk_pipeline_robustness_state *rs);
+
+void
+nvk_shader_offline_preprocess(struct vk_physical_device *device, nir_shader *nir,
+                              const struct vk_pipeline_robustness_state *rs);
+
+void nvk_shader_offline_fs_key(struct nak_fs_key *key,
+                               const struct vk_graphics_pipeline_state *state);
+
+void
+nvk_shader_offline_lower(struct nvk_device *dev, nir_shader *nir,
+                         VkShaderCreateFlagsEXT shader_flags,
+                         const struct vk_pipeline_robustness_state *rs,
+                         uint32_t set_layout_count,
+                         struct vk_descriptor_set_layout *const *set_layouts,
+                         struct nvk_cbuf_map *cbuf_map_out);
+#endif /* NVK_SHADER_LOWER_NIR_ONLY */
+
 #endif

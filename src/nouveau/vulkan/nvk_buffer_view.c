@@ -43,6 +43,10 @@ nvk_get_buffer_format_features(const struct nvk_physical_device *pdev,
    return features;
 }
 
+/* Everything above is a pure function of the device info; the view objects below are the
+ * driver's, which a lowering-only build stops before. */
+#ifndef NVK_SHADER_LOWER_NIR_ONLY
+
 VKAPI_ATTR VkResult VKAPI_CALL
 nvk_CreateBufferView(VkDevice _device,
                      const VkBufferViewCreateInfo *pCreateInfo,
@@ -118,3 +122,5 @@ nvk_DestroyBufferView(VkDevice _device,
 
    vk_buffer_view_destroy(&dev->vk, pAllocator, &view->vk);
 }
+
+#endif /* NVK_SHADER_LOWER_NIR_ONLY */

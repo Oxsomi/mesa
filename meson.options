@@ -926,7 +926,8 @@ option(
 option(
   'spirv2isa-backends',
   type : 'array',
-  choices : ['amd', 'intel'],
+  choices : ['amd', 'intel', 'nvidia'],
   value : ['amd', 'intel'],
-  description : 'Which spirv2isa backends to build; one of them is enough to get a library'
+  description : 'Which spirv2isa backends to build; one is enough to get a library. nvidia is ' +
+                'opt-in because NAK requires a Rust toolchain.'
 )

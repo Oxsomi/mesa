@@ -30,6 +30,17 @@ static_assert(S2I_INTEL_ANV_MAX_SETS == MAX_SETS,
  * here also keeps anv_instance.c, and the whole instance and entrypoint world, out of the link. */
 enum anv_debug anv_debug;
 
+/* In a build whose dispatcher library also carries the NVIDIA backend, mesa's real Vulkan runtime
+ * is linked whole and defines both of these; the stand-ins must give way or the link sees them
+ * twice. The offline instance and device carry typed bases and initialized messenger lists, so the
+ * real __vk_log_impl is safe when it serves instead. */
+#ifndef S2I_SHARED_VK_RUNTIME
+
+/* The property table reports the runtime's shader-module hashing algorithm; the constant lives in
+ * vk_shader_module.c, whose other functions need the common entrypoints this build stops before.
+ * The value mirrors that definition, and only names a hash in a property nothing offline reads. */
+const uint8_t vk_shaderModuleIdentifierAlgorithmUUID[VK_UUID_SIZE] = "MESA-BLAKE3";
+
 /* vk_nir logs SPIR-V diagnostics through the instance's debug messengers, which an offline compile
  * has none of; stderr is where a command line tool's diagnostics belong. */
 void
@@ -46,6 +57,8 @@ __vk_log_impl(VkDebugUtilsMessageSeverityFlagBitsEXT severity, VkDebugUtilsMessa
    fputc('\n', stderr);
    va_end(args);
 }
+
+#endif /* S2I_SHARED_VK_RUNTIME */
 
 /* ANV builds a softfp64 helper library on the device when a shader wants doubles on hardware without
  * them. Its only caller is gated behind drirc.debug.fp64_emu, which a synthesized instance leaves off,
@@ -78,6 +91,19 @@ s2i_intel_anv_init_physical_device(struct anv_physical_device *pdev,
     * supported tables off the physical device; both are what ANV itself would report. */
    pdev->instance->vk.app_info.api_version = ANV_API_VERSION;
    pdev->vk.instance = &pdev->instance->vk;
+
+   /* Whichever __vk_log_impl serves (the real runtime's in a shared-runtime build, the stand-in
+    * above otherwise), it resolves the instance through typed object bases and reads its messenger
+    * lists; typed, client-visible bases and empty lists keep a vtn diagnostic a log line. */
+   pdev->instance->vk.base.type = VK_OBJECT_TYPE_INSTANCE;
+   pdev->instance->vk.base.client_visible = true;
+   list_inithead(&pdev->instance->vk.debug_report.callbacks);
+   mtx_init(&pdev->instance->vk.debug_report.callbacks_mutex, mtx_plain);
+   list_inithead(&pdev->instance->vk.debug_utils.instance_callbacks);
+   list_inithead(&pdev->instance->vk.debug_utils.callbacks);
+   mtx_init(&pdev->instance->vk.debug_utils.callbacks_mutex, mtx_plain);
+   pdev->vk.base.type = VK_OBJECT_TYPE_PHYSICAL_DEVICE;
+   pdev->vk.base.client_visible = true;
 
    pdev->info = *devinfo;
    pdev->compiler = compiler;

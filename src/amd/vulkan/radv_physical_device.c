@@ -2516,6 +2516,19 @@ radv_is_gpu_supported(const struct radeon_info *info)
    return true;
 }
 
+/* For the offline compiler (spirv2isa): the tables a physical device would report, filled by the same
+ * three functions the driver fills them from, so its SPIR-V capability gate cannot drift from the
+ * driver's own answer. All three read the device info and the instance and nothing that needs a
+ * winsys or an open device, which is what makes this callable without one.
+ */
+void
+radv_physical_device_offline_supported(struct radv_physical_device *pdev)
+{
+   radv_physical_device_get_supported_extensions(pdev, &pdev->vk.supported_extensions);
+   radv_physical_device_get_features(pdev, &pdev->vk.supported_features);
+   radv_get_physical_device_properties(pdev);
+}
+
 static VkResult
 radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm_device,
                                 struct radv_physical_device **pdev_out)

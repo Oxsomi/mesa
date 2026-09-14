@@ -1154,11 +1154,6 @@ anx_get_physical_device_max_heap_size(const struct anv_physical_device *pdevice)
    return ret;
 }
 
-/* Everything above is a pure function of the physical device: the extension and feature
- * tables. Everything below talks to a kernel or allocates, so a build that only wants the
- * tables (ANV_PHYSICAL_DEVICE_FEATURES_ONLY) stops here. */
-#ifndef ANV_PHYSICAL_DEVICE_FEATURES_ONLY
-
 static void
 get_properties_1_1(const struct anv_physical_device *pdevice,
                    struct vk_properties *p)
@@ -2299,6 +2294,12 @@ get_properties(const struct anv_physical_device *pdevice,
       props->maxDeviceFaultCount = UINT32_MAX;
    }
 }
+
+/* Everything above is a pure function of the physical device: the extension, feature and property
+ * tables (the SPIR-V capability mapping gates the subgroup and float-controls capabilities on the
+ * last of these). Everything below talks to a kernel or allocates, so a build that only wants the
+ * tables (ANV_PHYSICAL_DEVICE_FEATURES_ONLY) stops here. */
+#ifndef ANV_PHYSICAL_DEVICE_FEATURES_ONLY
 
 /* This function restricts the maximum size of system memory heap. The
  * reasoning is that if we allow all the RAM to be used by graphics, nothing
@@ -3642,6 +3643,7 @@ anv_physical_device_offline_supported(struct anv_physical_device *pdevice)
 {
    get_device_extensions(pdevice, &pdevice->vk.supported_extensions);
    get_features(pdevice, &pdevice->vk.supported_features);
+   get_properties(pdevice, &pdevice->vk.properties);
 }
 
 #endif /* ANV_PHYSICAL_DEVICE_FEATURES_ONLY */

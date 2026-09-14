@@ -132,8 +132,8 @@ executable(
 nouveau_util_py = files('util.py')
 nouveau_util_py_path = meson.current_source_dir()
 
-# Only generate Rust bindings for NVK
-if with_nouveau_vk
+# Rust bindings, for NVK and for the spirv2isa backend that reuses its compiler stack
+if with_nouveau_vk or with_spirv2isa_nvidia
   cl_rs_generated = []
   foreach cl : nv_classes
     cl_rs_generated += custom_target(

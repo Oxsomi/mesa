@@ -90,8 +90,12 @@ radv_compile_cs(const struct radv_compiler_info *compiler_info, struct radv_shad
                 struct radv_shader_debug_info *dbg)
 {
 
-   /* Compile SPIR-V shader to NIR. */
+   /* Compile SPIR-V shader to NIR. A driver only reaches this with a module the validation layers
+    * accepted, so a parse failure is the caller's to report; spirv2isa has no layer in front of it. */
    cs_stage->nir = radv_shader_spirv_to_nir(compiler_info, cs_stage, NULL, is_internal);
+
+   if (!cs_stage->nir)
+      return NULL;
 
    NIR_PASS(_, cs_stage->nir, ac_nir_lower_indirect_derefs);
    NIR_PASS(_, cs_stage->nir, nir_lower_vars_to_ssa);

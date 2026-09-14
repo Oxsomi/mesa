@@ -21,6 +21,11 @@ if with_spirv2isa_intel
   spirv2isa_deps += idep_spirv2isa_intel
 endif
 
+if with_spirv2isa_nvidia
+  spirv2isa_args += '-DS2I_HAVE_NVIDIA'
+  spirv2isa_deps += idep_spirv2isa_nvidia
+endif
+
 libspirv2isa = static_library(
   'spirv2isa',
   files('spirv2isa.c'),
@@ -45,5 +50,5 @@ executable(
   include_directories : [ include_directories('.'), inc_include, inc_src ],
   dependencies : [ idep_spirv2isa ],
   build_by_default : true,
-  install : false,
+  install : true,
 )

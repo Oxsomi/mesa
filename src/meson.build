@@ -74,7 +74,7 @@ endif
 if with_wayland_bind_display
   subdir('egl/wayland/wayland-drm')
 endif
-if with_any_vk or with_gallium_zink or with_spirv2isa_intel
+if with_any_vk or with_gallium_zink or with_spirv2isa_intel or with_spirv2isa_nvidia
   subdir('vulkan')
 endif
 if with_virtio_vk
@@ -102,6 +102,10 @@ if with_any_intel or with_spirv2isa_intel
   subdir('intel')
 endif
 
+# nouveau before the spirv2isa dispatcher, which links its backend
+if with_any_nouveau or with_spirv2isa_nvidia
+  subdir('nouveau')
+endif
 if with_spirv2isa
   subdir('spirv2isa')
 endif
@@ -110,9 +114,6 @@ if with_gallium_panfrost or with_gallium_lima or with_panfrost_vk or with_tools.
 endif
 if with_microsoft_clc or with_gallium_d3d12 or with_spirv_to_dxil or with_microsoft_vk
   subdir('microsoft')
-endif
-if with_any_nouveau
-  subdir('nouveau')
 endif
 if with_gfxstream_vk
   dep_virtgpu_kumquat_ffi = null_dep

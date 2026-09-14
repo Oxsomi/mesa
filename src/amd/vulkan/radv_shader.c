@@ -536,6 +536,15 @@ radv_shader_spirv_to_nir(const struct radv_compiler_info *compiler_info, struct 
       };
       nir = spirv_to_nir(spirv, stage->spirv.size / 4, spec, stage->stage, stage->entrypoint, &spirv_options,
                          &compiler_info->nir_options[stage->stage]);
+
+      /* A driver reaches this only with a module the validation layers already accepted, so a parse
+       * failure is a caller error rather than a driver one, and the caller is the one that can name
+       * it. spirv2isa has no layer in front of it, so this is reachable there. */
+      if (!nir) {
+         vtn_free_specialization(spec);
+         return NULL;
+      }
+
       nir->info.internal |= is_internal;
       assert(nir->info.stage == stage->stage);
 

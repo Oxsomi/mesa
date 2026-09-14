@@ -21,16 +21,14 @@ extern "C" {
 #endif
 
 /* s2i_compile for an AMD target, taking AMD's own stats. See s2i_compile for the arguments. */
-s2i_result s2i_amd_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2i_stage stage,
-                           int target_index, const VkDescriptorSetLayoutCreateInfo *const *set_layouts,
-                             uint32_t set_layout_count,
-                           s2i_features features_used, char **isa_text, s2i_stats_amd *stats,
-                           s2i_info *info, char **message);
+s2i_result s2i_amd_compile(const uint32_t *spirv, size_t spirv_words, const char *entry,
+                           s2i_stage stage, int target_index, const s2i_pipeline *pipeline,
+                           char **isa_text, s2i_stats_amd *stats, s2i_info *info, char **message);
 
 /* s2i_compile_rt_pipeline for an AMD target. See s2i_compile_rt_pipeline for the arguments. */
-s2i_result s2i_amd_compile_rt_pipeline(const s2i_rt_shader *shaders, size_t shader_count, size_t entry_index,
-                                       int compile_traversal, int target_index, const VkDescriptorSetLayoutCreateInfo *const *set_layouts,
-                             uint32_t set_layout_count, s2i_features features_used, char **isa_text,
+s2i_result s2i_amd_compile_rt_pipeline(const s2i_rt_shader *shaders, size_t shader_count,
+                                       size_t entry_index, int compile_traversal, int target_index,
+                                       const s2i_pipeline *pipeline, char **isa_text,
                                        s2i_stats_amd *stats, char **message);
 
 /* The capabilities this target doesn't support, newline separated and malloc'd, or NULL for none. */
@@ -38,6 +36,14 @@ char *s2i_amd_unsupported_caps(const uint32_t *caps_used, size_t caps_count, int
 
 /* Human-readable name of an AMD target, "" when the index isn't one. */
 const char *s2i_amd_target_name(int target_index);
+
+/* Total targets across both tiers, flagships first: the enum's constants, then every other GFX8+
+ * family Mesa's tables know, enumerated at runtime. */
+int s2i_amd_target_count(void);
+
+/* Token of an extended-tier target, "" for a flagship index (whose token the dispatcher owns) and
+ * for out of range. */
+const char *s2i_amd_target_token(int target_index);
 
 #ifdef __cplusplus
 }

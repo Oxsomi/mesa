@@ -10,6 +10,7 @@
 
 #include "spirv2isa_intel.h"
 
+#include <stdarg.h>                       /* va_list for the perf-log sink below */
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -21,7 +22,6 @@
 #include "dev/intel_device_info.h"        /* intel_get_device_info_from_pci_id */
 #include "dev/intel_debug.h"              /* process_intel_debug_variable (inits INTEL_SIMD/DEBUG globals) */
 #include "compiler/shader_enums.h"        /* mesa_shader_stage / MESA_SHADER_* */
-#include "compiler/glsl_types.h"          /* glsl_type_singleton_init_or_ref/decref (no device inits it) */
 #include "compiler/nir/nir.h"             /* nir_shader, address formats, gather_info */
 #include "compiler/spirv/nir_spirv.h"     /* spirv_to_nir + options */
 #include "compiler/spirv/spirv_info.h"    /* struct spirv_capabilities */
@@ -33,8 +33,12 @@
 #include "anv_shader.h"                     /* anv_shader_data + the offline entry points */
 #include "vk_nir.h"                        /* vk_spirv_to_nir, the runtime's SPIR-V front door */
 #include "vk_pipeline.h"                   /* vk_pipeline_robustness_state */
+#include "spirv2isa_state.h"       /* the pipeline state a module does not carry */
+#include "spirv2isa_session.h"     /* the generic setup and its one teardown */
+#include "spirv2isa_layout.h"      /* the descriptor layout resolve every backend shares */
 #include "util/simple_mtx.h"
 #include "spirv2isa_stage.h"
+#include "spirv2isa_caps.h"          /* the declared-capability gate every backend shares */
 #include "spirv2isa_intel_anv.h"           /* the inputs those passes read, built without a device */
 
 /* The ISA capture mutates process globals (the intel_debug bitset and fd 2), so captures are
@@ -56,9 +60,100 @@ static const struct s2i_intel_target_desc s2i_intel_targets[S2I_TARGET_INTEL_COU
    [S2I_TARGET_INDEX_OF(S2I_TARGET_XE2_BMG)]    = { 0xe20b, "Xe2 Battlemage (BMG G21, Arc B580)" },
 };
 
+/*
+ * The extended tier: every Gen9+ PCI id in Mesa's own probe database (the same X-macro list the
+ * driver builds its device table from), so new ids appear with a Mesa update rather than an edit
+ * here. The build filter drops preproduction (force-probe) ids, ids that predate the backend's
+ * Gen9 floor, and ids a flagship row already names; the info-fill check is defensive, since the
+ * ids come from that fill's own table. Tokens are the PCI id itself. Built
+ * once on first use, unsynchronized like the library's other process-global state.
+ */
+static const struct {
+   int pci_id;
+   const char *name;
+   int force_probe; /* preproduction id the driver refuses without INTEL_FORCE_PROBE; not listed */
+} s2i_intel_pci_db[] = {
+#define FORCE_PROBE 1
+#define CHIPSET(id, family, fam_str, name, ...) { id, name, __VA_ARGS__ + 0 },
+#include "pci_ids/iris_pci_ids.h"
+#undef CHIPSET
+#undef FORCE_PROBE
+};
 
-/* brw calls compiler->shader_{debug,perf}_log during codegen with no NULL check; the driver normally
- * installs these. Without them a plain compile (no INTEL_DEBUG) calls a NULL pointer and crashes. */
+static struct {
+   struct s2i_intel_target_desc row;
+   char token[8];
+} s2i_intel_extended[ARRAY_SIZE(s2i_intel_pci_db)];
+static int s2i_intel_extended_count = -1;
+
+static void
+s2i_intel_build_extended(void)
+{
+   if (s2i_intel_extended_count >= 0)
+      return;
+
+   int n = 0;
+
+   for (size_t i = 0; i < ARRAY_SIZE(s2i_intel_pci_db); ++i) {
+
+      struct intel_device_info devinfo;
+      int flagship = 0;
+
+      for (int j = 0; j < (int)S2I_TARGET_INTEL_COUNT; ++j)
+         flagship |= s2i_intel_targets[j].pci_id == s2i_intel_pci_db[i].pci_id;
+
+      if (flagship || s2i_intel_pci_db[i].force_probe ||
+          !intel_get_device_info_from_pci_id(s2i_intel_pci_db[i].pci_id, &devinfo) || devinfo.ver < 9)
+         continue;
+
+      s2i_intel_extended[n].row.pci_id = s2i_intel_pci_db[i].pci_id;
+      s2i_intel_extended[n].row.name = s2i_intel_pci_db[i].name;
+      snprintf(s2i_intel_extended[n].token, sizeof(s2i_intel_extended[n].token), "0x%04x",
+               (unsigned)s2i_intel_pci_db[i].pci_id);
+      ++n;
+   }
+
+   s2i_intel_extended_count = n;
+}
+
+/* Row for a target index across both tiers, NULL when the index is out of range. */
+static const struct s2i_intel_target_desc *
+s2i_intel_target(int target_index)
+{
+   if (target_index >= 0 && target_index < (int)S2I_TARGET_INTEL_COUNT)
+      return &s2i_intel_targets[target_index];
+
+   s2i_intel_build_extended();
+
+   if (target_index >= (int)S2I_TARGET_INTEL_COUNT &&
+       target_index < (int)S2I_TARGET_INTEL_COUNT + s2i_intel_extended_count)
+      return &s2i_intel_extended[target_index - S2I_TARGET_INTEL_COUNT].row;
+
+   return NULL;
+}
+
+int
+s2i_intel_target_count(void)
+{
+   s2i_intel_build_extended();
+   return (int)S2I_TARGET_INTEL_COUNT + s2i_intel_extended_count;
+}
+
+const char *
+s2i_intel_target_token(int target_index)
+{
+   s2i_intel_build_extended();
+
+   if (target_index < (int)S2I_TARGET_INTEL_COUNT ||
+       target_index >= (int)S2I_TARGET_INTEL_COUNT + s2i_intel_extended_count)
+      return "";
+
+   return s2i_intel_extended[target_index - S2I_TARGET_INTEL_COUNT].token;
+}
+
+/* brw calls compiler->shader_{debug,perf}_log during codegen with no NULL check, so both must exist.
+ * The debug one is dropped: it prints the same numbers brw writes into genisa_stats a few lines
+ * later, which the stats below read from the struct instead. */
 static void
 s2i_intel_log_noop(void *data, unsigned *id, const char *fmt, ...)
 {
@@ -67,69 +162,38 @@ s2i_intel_log_noop(void *data, unsigned *id, const char *fmt, ...)
    (void)fmt;
 }
 
+/* Where the perf log accumulates, for the length of one compile. */
+struct s2i_intel_log_sink {
+   char *notes;   /* on the session context, never NULL once opened */
+};
+
+/* The perf log is worth keeping: it is the only place brw says why it rejected a WIDER SIMD variant
+ * than the one it shipped, and when a shader spilled. A total failure already reaches the caller
+ * through params.base.error_str, but a partial one (SIMD32 refused, SIMD16 compiled) is invisible
+ * otherwise, and it is the answer to "why did I get this dispatch width". */
+static void
+s2i_intel_perf_log(void *data, unsigned *id, const char *fmt, ...)
+{
+   struct s2i_intel_log_sink *sink = (struct s2i_intel_log_sink *)data;
+
+   (void)id;
+
+   if (!sink || !sink->notes)
+      return;
+
+   va_list args;
+   va_start(args, fmt);
+   ralloc_vasprintf_append(&sink->notes, fmt, args);
+   va_end(args);
+}
+
 const char *
 s2i_intel_target_name(int target_index)
 {
-   if (target_index < 0 || target_index >= S2I_TARGET_INTEL_COUNT)
-      return "";
-   return s2i_intel_targets[target_index].name;
+   const struct s2i_intel_target_desc *t = s2i_intel_target(target_index);
+
+   return t ? t->name : "";
 }
-
-
-/* Primary feature gate: the caller declares which features the module uses as an s2i_features mask
- * (spirv2isa.h, values owned by us), so we gate without parsing SPIR-V and without knowing the
- * caller's own feature enum. See the AMD side and the shared header for why the translation lives on
- * the caller. */
-enum s2i_intel_support { S2I_INTEL_SUP_OK, S2I_INTEL_SUP_NOT_WIRED, S2I_INTEL_SUP_UNSUPPORTED };
-
-/* Verdict for one feature on brw. Anything not named here is supported, which is now nearly everything:
- * all 14 stages (the ray tracing pipeline stages included), buffers, images, textures, bindless /
- * dynamic descriptor arrays, descriptor heap, multiview, ray query, ray triangle position fetch and
- * cooperative matrix. Only what vtn itself rejects is listed. Every entry was checked against a real
- * corpus shader with the gate bypassed; do not gate a feature that has not been observed to fail, and
- * re-check these whenever a stage or lowering is added (wiring the RT stages made two of them stale).
- * MESH_TASK_TEX_DERIV is deliberately absent but UNTESTED: OxC3 emits no SPIR-V for it today. */
-static enum s2i_intel_support
-s2i_intel_ext_verdict(s2i_feature bit, const char **name)
-{
-   switch (bit) {
-   case S2I_FEATURE_COOP_VECTOR:          *name = "cooperative vector (NVIDIA)";          return S2I_INTEL_SUP_UNSUPPORTED;
-   case S2I_FEATURE_COOP_VECTOR_TRAINING: *name = "cooperative vector training (NVIDIA)"; return S2I_INTEL_SUP_UNSUPPORTED;
-   case S2I_FEATURE_RAY_REORDER:          *name = "shader execution reorder (SER)";       return S2I_INTEL_SUP_UNSUPPORTED;
-   case S2I_FEATURE_RAY_MICROMAP_OPACITY: *name = "ray opacity micromap";                 return S2I_INTEL_SUP_UNSUPPORTED;
-   default:                               return S2I_INTEL_SUP_OK;
-   }
-}
-
-/* Walk the caller-declared feature set; first unsupported/not-wired feature -> clean message. */
-static bool
-s2i_intel_gate_extensions(s2i_features features, const char *target_name, char **message)
-{
-   for (uint32_t b = features; b; b &= b - 1) {
-      uint32_t bit = b & (uint32_t)(-(int32_t)b);
-      const char *name = NULL;
-      enum s2i_intel_support s = s2i_intel_ext_verdict((s2i_feature)bit, &name);
-      if (s != S2I_INTEL_SUP_OK) {
-         if (message) {
-            char buf[160];
-            snprintf(buf, sizeof(buf), "%s is %s on %s", name,
-                     s == S2I_INTEL_SUP_NOT_WIRED ? "not yet supported by this offline compiler"
-                                                  : "not supported by this backend",
-                     target_name);
-            *message = strdup(buf);
-         }
-         return true;
-      }
-   }
-   return false;
-}
-
-
-
-
-
-
-
 
 /* Every intrinsic that must be gone before brw sees the shader. brw_from_nir has no default case, so
  * one left here aborts with no explanation; naming it makes that an ordinary refusal instead. */
@@ -183,231 +247,72 @@ s2i_intel_first_unlowered(nir_shader *nir)
    return NULL;
 }
 
-/* The descriptor type a resource variable would need in a layout. The inference is only for the
- * synthesized fallback; a caller-supplied layout is taken at its word. */
-static VkDescriptorType
-s2i_intel_var_descriptor_type(const nir_variable *var)
-{
-   const struct glsl_type *type = glsl_without_array(var->type);
-
-   if (var->data.mode == nir_var_mem_ubo)
-      return VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-
-   if (var->data.mode == nir_var_mem_ssbo)
-      return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-
-   if (glsl_type_is_image(type)) {
-      return glsl_get_sampler_dim(type) == GLSL_SAMPLER_DIM_BUF ?
-             VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-   }
-
-   if (glsl_type_is_sampler(type))
-      return VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-
-   if (glsl_type_is_texture(type)) {
-      return glsl_get_sampler_dim(type) == GLSL_SAMPLER_DIM_BUF ?
-             VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-   }
-
-   return VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
-}
-
-#define S2I_INTEL_RESOURCE_MODES \
-   (nir_var_uniform | nir_var_mem_ubo | nir_var_mem_ssbo | nir_var_image)
-
-/* ANV's lowering assumes a layout covers every descriptor the module touches, because a driver is
- * handed one the validation layers already vetted. Nothing vets one here, so a supplied layout is
- * checked against the module (a miss is a refusal, not corruption two passes later), and no layout at
- * all synthesizes one from the module's own variables, which is the fallback the API promises. */
-static bool
-s2i_intel_resolve_layouts(nir_shader *nir,
-                          const VkDescriptorSetLayoutCreateInfo *const *set_layouts,
-                          uint32_t set_layout_count, void *mem_ctx,
-                          const VkDescriptorSetLayoutCreateInfo *const **out_layouts,
-                          uint32_t *out_count, char **message)
-{
-   const bool synthesize = set_layout_count == 0;
-
-   uint32_t nbind[S2I_INTEL_ANV_MAX_SETS];
-   memset(nbind, 0, sizeof(nbind));
-
-   uint32_t highest_set = 0;
-   bool any = false;
-
-   nir_foreach_variable_with_modes(var, nir, S2I_INTEL_RESOURCE_MODES) {
-      const uint32_t set = var->data.descriptor_set;
-      const uint32_t binding = var->data.binding;
-      const uint32_t aoa = glsl_get_aoa_size(var->type);
-      const uint32_t count = aoa ? aoa : 1;
-
-      if (set >= S2I_INTEL_ANV_MAX_SETS) {
-
-         if (message) {
-            char buf[128];
-            snprintf(buf, sizeof(buf), "the module uses descriptor set %u; sets go up to %u", set,
-                     S2I_INTEL_ANV_MAX_SETS - 1);
-            *message = strdup(buf);
-         }
-
-         return false;
-      }
-
-      any = true;
-      highest_set = MAX2(highest_set, set);
-      nbind[set] = MAX2(nbind[set], binding + 1);
-
-      if (synthesize)
-         continue;
-
-      const VkDescriptorSetLayoutBinding *found = NULL;
-
-      if (set < set_layout_count && set_layouts[set]) {
-         for (uint32_t b = 0; b < set_layouts[set]->bindingCount; b++) {
-            if (set_layouts[set]->pBindings[b].binding == binding) {
-               found = &set_layouts[set]->pBindings[b];
-               break;
-            }
-         }
-      }
-
-      if (!found || found->descriptorCount < count) {
-
-         if (message) {
-            char buf[192];
-            snprintf(buf, sizeof(buf),
-                     "the module uses descriptor set %u binding %u (count %u), which the supplied "
-                     "layout does not %s", set, binding, count,
-                     found ? "cover at that count" : "contain");
-            *message = strdup(buf);
-         }
-
-         return false;
-      }
-   }
-
-   if (!synthesize || !any) {
-      *out_layouts = set_layouts;
-      *out_count = synthesize ? 0 : set_layout_count;
-      return true;
-   }
-
-   const uint32_t count = highest_set + 1;
-
-   VkDescriptorSetLayoutCreateInfo *infos =
-      rzalloc_array(mem_ctx, VkDescriptorSetLayoutCreateInfo, count);
-   const VkDescriptorSetLayoutCreateInfo **ptrs =
-      rzalloc_array(mem_ctx, const VkDescriptorSetLayoutCreateInfo *, count);
-
-   for (uint32_t set = 0; set < count; set++) {
-      infos[set].sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-
-      if (nbind[set])
-         infos[set].pBindings = rzalloc_array(mem_ctx, VkDescriptorSetLayoutBinding, nbind[set]);
-
-      ptrs[set] = &infos[set];
-   }
-
-   nir_foreach_variable_with_modes(var, nir, S2I_INTEL_RESOURCE_MODES) {
-      VkDescriptorSetLayoutCreateInfo *info = &infos[var->data.descriptor_set];
-      VkDescriptorSetLayoutBinding *bindings = (VkDescriptorSetLayoutBinding *)info->pBindings;
-      const uint32_t aoa = glsl_get_aoa_size(var->type);
-
-      bool merged = false;
-
-      for (uint32_t b = 0; b < info->bindingCount; b++) {
-         if (bindings[b].binding == var->data.binding) {
-            merged = true;
-            break;
-         }
-      }
-
-      if (merged)
-         continue;
-
-      bindings[info->bindingCount++] = (VkDescriptorSetLayoutBinding) {
-         .binding = var->data.binding,
-         .descriptorType = s2i_intel_var_descriptor_type(var),
-         .descriptorCount = aoa ? aoa : 1,
-         .stageFlags = VK_SHADER_STAGE_ALL,
-      };
-   }
-
-   *out_layouts = ptrs;
-   *out_count = count;
-   return true;
-}
-
 s2i_result
 s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2i_stage stage,
-                  int target_index, const VkDescriptorSetLayoutCreateInfo *const *set_layouts,
-                             uint32_t set_layout_count,
-                  s2i_features features_used, char **isa_text, s2i_stats_intel *stats,
-                  s2i_info *info, char **message)
+                  int target_index, const s2i_pipeline *pipeline, char **isa_text,
+                  s2i_stats_intel *stats, s2i_info *info, char **message)
 {
    if (isa_text)
       *isa_text = NULL;
    if (message)
       *message = NULL;
 
-   if (!spirv || spirv_words < 5 || spirv[0] != 0x07230203u)
+   if (!s2i_module_args_ok(spirv, spirv_words, entry, stage) || target_index < 0 ||
+       target_index >= s2i_intel_target_count())
       return S2I_BAD_SPIRV;
-   if (!entry || target_index < 0 || target_index >= S2I_TARGET_INTEL_COUNT || stage < 0 ||
-       stage >= S2I_STAGE_COUNT)
-      return S2I_BAD_SPIRV;
-
-   /* Primary gate: the caller-declared feature set (OxC3 translates its oiSH ESHExtension into it). */
-   if (features_used && s2i_intel_gate_extensions(features_used, s2i_intel_target_name(target_index), message))
-      return S2I_UNSUPPORTED_CAP;
-
-   /* All of compute + vertex + fragment + geometry + tessellation control/eval are wired. The graphics
-    * stages run their own input lowering inside brw_compile_*; TES computes its input VUE map itself
-    * when we leave it NULL. (Mesh/task are not in the s2i_stage enum yet.) */
 
    /* Initialize the INTEL_DEBUG / INTEL_SIMD globals a driver would set at startup; without this the
     * SIMD-width selection reads every width as disabled and nothing compiles. call_once-guarded. */
    process_intel_debug_variable();
 
-   void *mem_ctx = ralloc_context(NULL);
+   struct s2i_session session;
 
-   /* No device did this for us; the glsl type system uses a singleton linear allocator. */
-   glsl_type_singleton_init_or_ref();
+   if (!s2i_session_open(&session))
+      return S2I_COMPILE_FAILED;
+
+   /* Everything the one teardown below releases, declared before the first jump to it. */
+   s2i_result result = S2I_OK;
+   FILE *cap = NULL;
+   s2i_intel_anv_layouts layouts;
+   bool layouts_built = false;
 
    /* Device-free devinfo from a PCI id, then the brw compiler from just that. */
    struct intel_device_info devinfo;
-   if (!intel_get_device_info_from_pci_id(s2i_intel_targets[target_index].pci_id, &devinfo)) {
-      glsl_type_singleton_decref();
-      ralloc_free(mem_ctx);
+   if (!intel_get_device_info_from_pci_id(s2i_intel_target(target_index)->pci_id, &devinfo)) {
+
       if (message)
          *message = strdup("intel_get_device_info_from_pci_id failed");
-      return S2I_BAD_TARGET;
+
+      result = S2I_BAD_TARGET;
+      goto done;
    }
+
    /* Normally filled by the kernel from a DRM query, and left 0 by the PCI-id path. It gates brw's
     * load/store vectorizer, so it decides how many loads merge and therefore the instruction count.
     * Derived the way the kernel derives it (i915/intel_device_info.c). */
    if (devinfo.mem_alignment == 0)
       devinfo.mem_alignment = (devinfo.verx10 >= 125 || devinfo.has_local_mem) ? 64 * 1024 : 4096;
-   struct brw_compiler *compiler = brw_compiler_create(mem_ctx, &devinfo);
+
+   struct brw_compiler *compiler = brw_compiler_create(session.mem_ctx, &devinfo);
 
    /* Must exist before spirv_to_nir: the address formats below are derived from it. */
-   struct anv_physical_device *pdev = rzalloc(mem_ctx, struct anv_physical_device);
-   s2i_intel_anv_init_physical_device(pdev, &devinfo, compiler, mem_ctx);
+   struct anv_physical_device *pdev = rzalloc(session.mem_ctx, struct anv_physical_device);
+   s2i_intel_anv_init_physical_device(pdev, &devinfo, compiler, session.mem_ctx);
 
-   /* Robust access is caller pipeline state, and each field flips a UBO/SSBO address format between
-    * the offset and bounded forms, so it moves every buffer access. OxC3 does not enable it today;
-    * when it does, this becomes a declared toggle on s2i_compile rather than a constant. */
-   static const struct vk_pipeline_robustness_state s2i_rs_disabled = {
-      .storage_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT,
-      .uniform_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT,
-      .vertex_inputs = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT,
-      .images = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT,
-   };
+   /* Each field flips a UBO/SSBO address format between the offset and bounded forms. */
+   const struct vk_pipeline_robustness_state rs = s2i_robustness_state(pipeline->robustness);
    compiler->shader_debug_log = s2i_intel_log_noop;
-   compiler->shader_perf_log = s2i_intel_log_noop;
+   compiler->shader_perf_log = s2i_intel_perf_log;
 
    const mesa_shader_stage ms = s2i_stage_to_mesa(stage);
 
-   /* Only ->physical and the mirrored fields are read; the log stub answers for the runtime. */
-   struct anv_device *device = rzalloc(mem_ctx, struct anv_device);
+   /* Only ->physical, the mirrored fields and the object base are read; logging resolves the
+    * instance through the base (see the instance setup in spirv2isa_intel_anv.c). */
+   struct anv_device *device = rzalloc(session.mem_ctx, struct anv_device);
+   device->vk.base.type = VK_OBJECT_TYPE_DEVICE;
+   device->vk.base.client_visible = true;
+   /* The logger resolves any owned object through base.device, a device's own base included. */
+   device->vk.base.device = &device->vk;
    device->physical = pdev;
    device->info = &pdev->info;
    device->isl_dev = pdev->isl_dev;
@@ -418,48 +323,40 @@ s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, 
     * functions inlined, clip and cull distances merged). A foreign module (glslang, -Od) arrives in
     * the same shape DXC output does. */
    struct spirv_to_nir_options spirv_opts =
-      anv_shader_offline_spirv_options(&pdev->vk, ms, &s2i_rs_disabled);
+      anv_shader_offline_spirv_options(&pdev->vk, ms, &rs);
    const struct nir_shader_compiler_options *nir_options =
-      anv_shader_offline_nir_options(&pdev->vk, ms, &s2i_rs_disabled);
+      anv_shader_offline_nir_options(&pdev->vk, ms, &rs);
 
-   /* vtn treats an unsupported capability as a warning and parses on, because a driver can rely on
-    * the validation layers having already rejected the module. Nothing vets a module here, so each
-    * declared capability is checked against the same set vk_spirv_to_nir computes, and a miss is a
-    * refusal by name instead of a warning followed by an abort inside brw. */
+   /* Every capability the module declares, against the set this target really has. */
    const struct spirv_capabilities target_caps =
       vk_physical_device_get_spirv_capabilities(&pdev->vk);
 
-   for (size_t w = 5; w + 1 < spirv_words && (spirv[w] & 0xffffu) == SpvOpCapability;
-        w += spirv[w] >> 16) {
+   {
+      bool malformed = false;
+      char *refusal = s2i_gate_declared_capabilities(spirv, spirv_words, &target_caps,
+                                                     s2i_intel_target(target_index)->name, &malformed);
 
-      const SpvCapability cap = (SpvCapability)spirv[w + 1];
+      if (refusal) {
 
-      if (spirv_capabilities_get(&target_caps, cap))
-         continue;
+         if (message)
+            *message = refusal;
+         else
+            free(refusal);
 
-      if (message) {
-         char buf[160];
-         snprintf(buf, sizeof(buf), "the module declares SPIR-V capability %u (%s), which %s does "
-                  "not support", (unsigned)cap, spirv_capability_to_string(cap),
-                  s2i_intel_targets[target_index].name);
-         *message = strdup(buf);
+         result = malformed ? S2I_BAD_SPIRV : S2I_UNSUPPORTED_CAP;
+         goto done;
       }
-
-      glsl_type_singleton_decref();
-      ralloc_free(mem_ctx);
-      return S2I_UNSUPPORTED_CAP;
    }
 
    nir_shader *nir = vk_spirv_to_nir(&device->vk, spirv, spirv_words * 4, ms, entry, NULL,
-                                     &spirv_opts, nir_options, false, mem_ctx);
+                                     &spirv_opts, nir_options, false, session.mem_ctx);
 
    if (!nir) {
-      glsl_type_singleton_decref();
-      ralloc_free(mem_ctx);
       if (message)
          *message = strdup("vk_spirv_to_nir failed (bad entrypoint, or a capability this target "
                            "does not support; diagnostics on stderr)");
-      return S2I_NO_ENTRYPOINT;
+      result = S2I_NO_ENTRYPOINT;
+      goto done;
    }
 
    /* vk_pipeline.c's vk_set_subgroup_size, with the sizes ANV reports (get_properties_1_3): the
@@ -479,28 +376,24 @@ s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, 
    }
 
    /* ANV's preprocess hook: sysvals to varyings, access flags, brw's preprocessing, barrier modes. */
-   anv_shader_offline_preprocess(&pdev->vk, nir, &s2i_rs_disabled);
-
-   /* ANV's lowering, called rather than mirrored: cooperative matrix, storage images, multiview, ray
-    * queries, descriptors and the push-constant layout, in the order ANV maintains. */
+   anv_shader_offline_preprocess(&pdev->vk, nir, &rs);
 
    const VkDescriptorSetLayoutCreateInfo *const *eff_layouts = NULL;
    uint32_t eff_layout_count = 0;
 
-   if (!s2i_intel_resolve_layouts(nir, set_layouts, set_layout_count, mem_ctx, &eff_layouts,
-                                  &eff_layout_count, message)) {
-      glsl_type_singleton_decref();
-      ralloc_free(mem_ctx);
-      return S2I_UNSUPPORTED_CAP;
-   }
+   result = s2i_resolve_layouts(nir, S2I_INTEL_ANV_MAX_SETS, pipeline->set_layouts,
+                                pipeline->set_layout_count, session.mem_ctx, &eff_layouts,
+                                &eff_layout_count, message);
 
-   s2i_intel_anv_layouts layouts;
+   if (result != S2I_OK)
+      goto done;
 
    if (!s2i_intel_anv_build_layouts(pdev, eff_layouts, eff_layout_count, &layouts, message)) {
-      glsl_type_singleton_decref();
-      ralloc_free(mem_ctx);
-      return S2I_UNSUPPORTED_CAP;
+      result = S2I_UNSUPPORTED_CAP;
+      goto done;
    }
+
+   layouts_built = true;
 
    struct vk_shader_compile_info compile_info;
    memset(&compile_info, 0, sizeof(compile_info));
@@ -509,7 +402,7 @@ s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, 
    compile_info.set_layouts = (struct vk_descriptor_set_layout **) layouts.sets;
    compile_info.set_layout_count = layouts.set_count;
 
-   compile_info.robustness = &s2i_rs_disabled;
+   compile_info.robustness = &rs;
 
    struct anv_shader_data shader_data;
    memset(&shader_data, 0, sizeof(shader_data));
@@ -541,7 +434,24 @@ s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, 
       break;
    }
 
-   anv_shader_offline_populate_key(&pdev->vk, &shader_data, NULL /* graphics state */, link_stages);
+   struct vk_graphics_pipeline_all_state gfx_all;
+   struct vk_graphics_pipeline_state gfx_state;
+   const struct vk_graphics_pipeline_state *gfx = NULL;
+
+   if (pipeline->graphics) {
+
+      if (!s2i_graphics_state(&device->vk, pipeline->graphics, &gfx_all, &gfx_state, message)) {
+         result = S2I_UNSUPPORTED_CAP;
+         goto done;
+      }
+
+      gfx = &gfx_state;
+   }
+
+   anv_shader_offline_populate_key(&pdev->vk, &shader_data, gfx, link_stages);
+
+   if (info)
+      info->graphics_specialized = gfx != NULL;
 
    struct brw_stage_prog_data *base_prog_data;
    struct brw_base_prog_key *base_prog_key;
@@ -585,25 +495,41 @@ s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, 
     * all; the sized ones use ANV's own binding table bound. */
    if (!brw_shader_stage_requires_bindless_resources(ms)) {
       shader_data.bind_map.surface_to_descriptor =
-         rzalloc_array(mem_ctx, struct anv_pipeline_binding, MAX_BINDING_TABLE_SIZE);
+         rzalloc_array(session.mem_ctx, struct anv_pipeline_binding, MAX_BINDING_TABLE_SIZE);
       shader_data.bind_map.sampler_to_descriptor =
-         rzalloc_array(mem_ctx, struct anv_pipeline_binding, MAX_BINDING_TABLE_SIZE);
+         rzalloc_array(session.mem_ctx, struct anv_pipeline_binding, MAX_BINDING_TABLE_SIZE);
    }
 
-   anv_shader_lower_nir(device, mem_ctx, NULL /* graphics pipeline state */, &shader_data);
+   /* The layout apply writes an entry per embedded sampler it places, so the table has to exist for
+    * every stage, exactly as ANV sizes it from the layouts. Never zero length: rzalloc_array(0)
+    * gives a pointer the pass would still be indexing into. */
+   uint32_t embedded_samplers = 0;
 
-   /* The passes read the layouts, they do not keep them. */
-   s2i_intel_anv_free_layouts(&layouts);
+   for (uint32_t set = 0; set < layouts.set_count; set++) {
+      if (layouts.sets[set])
+         embedded_samplers += layouts.sets[set]->embedded_sampler_count;
+   }
 
+   shader_data.bind_map.embedded_sampler_to_binding =
+      rzalloc_array(session.mem_ctx, struct anv_pipeline_embedded_sampler_binding,
+                    MAX2(embedded_samplers, 1));
 
-   /* Compile to EU ISA. Use brw's own params union: every stage's params struct starts with the
-    * shared .base, and the per-stage tails differ, so a single stage's struct is NOT a safe superset
-    * for the others (fragment's max_polygons sits exactly where mesh keeps a wa_18019110168 function
-    * pointer, for instance). Zero the union, fill .base, and set only the fields of the stage in hand;
-    * everything left zero means "not supplied", which brw handles (NULL vue_map / tue_map). */
+   /* ANV's lowering run rather than mirrored, so the descriptor and push-constant placement is the
+    * driver's own. */
+   anv_shader_lower_nir(device, session.mem_ctx, NULL /* graphics pipeline state */, &shader_data);
+
+   /* Seeded rather than left NULL, so every append stays on the session context: ralloc's append
+    * allocates against a NULL context when the string is NULL. */
+   struct s2i_intel_log_sink sink = { .notes = ralloc_strdup(session.mem_ctx, "") };
+
+   /* Use brw's own params union: every stage's struct starts with the shared .base and the tails
+    * differ, so one stage's struct is not a safe superset for another (fragment's max_polygons sits
+    * where mesh keeps a wa_18019110168 function pointer). Zero it, fill .base, then only the fields
+    * of the stage in hand; what stays zero reads as not supplied. */
    union brw_any_compile_params params;
    memset(&params, 0, sizeof(params));
-   params.base.mem_ctx = mem_ctx;
+   params.base.mem_ctx = session.mem_ctx;
+   params.base.log_data = &sink;
    params.base.nir = nir;
    params.base.key = base_prog_key;
    params.base.prog_data = base_prog_data;
@@ -615,7 +541,7 @@ s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, 
     * and the per-stage compile params (the TCS key copy, TES and mesh and fragment inputs, the RT
     * resume shaders). The NULL is the intersection shader's any-hit, which becomes caller data when
     * the RT pipeline API carries hit groups. */
-   anv_shader_offline_finish(device, &shader_data, NULL, &params, mem_ctx);
+   anv_shader_offline_finish(device, &shader_data, NULL, &params, session.mem_ctx);
 
    /* Refuse by name anything no pass claimed, instead of letting brw abort on an intrinsic it
     * has no case for. A descriptor-heap module reaches here this way. */
@@ -631,9 +557,8 @@ s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, 
          *message = strdup(buf);
       }
 
-      glsl_type_singleton_decref();
-      ralloc_free(mem_ctx);
-      return S2I_UNSUPPORTED_CAP;
+      result = S2I_UNSUPPORTED_CAP;
+      goto done;
    }
 
    /* Capture the EU disassembly brw prints to stderr under INTEL_DEBUG. We set the stage's disasm bit
@@ -643,7 +568,6 @@ s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, 
     * remove the global mutation and the mutex with it. */
    const uint64_t dbg_flag = intel_debug_flag_for_shader_stage(ms);
    const bool dbg_was_set = BITSET_TEST(intel_debug, dbg_flag);
-   FILE *cap = NULL;
    int saved_stderr = -1;
    bool capture_locked = false;
 
@@ -676,20 +600,24 @@ s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, 
    if (capture_locked)
       simple_mtx_unlock(&s2i_intel_capture_mtx);
 
+   /* Handed over before the failure check: what brw remarked on explains a failed compile as often
+    * as a successful one. */
+   if (info && sink.notes && sink.notes[0])
+      info->notes = strdup(sink.notes);
+
    if (!program) {
       if (message)
          *message = strdup(params.base.error_str ? params.base.error_str : "brw_compile failed");
-      if (cap)
-         fclose(cap);
-      glsl_type_singleton_decref();
-      ralloc_free(mem_ctx);
-      return S2I_COMPILE_FAILED;
+      result = S2I_COMPILE_FAILED;
+      goto done;
    }
 
    if (stats) {
       memset(stats, 0, sizeof(*stats));
-      /* The widest variant brw actually compiled is the one the numbers describe; a fragment shader
-       * has several, and the earlier entries are the narrower ones. */
+      /* The widest variant brw emitted. Variants are appended narrowest first and each fills the
+       * next stats slot in order, so the last filled slot is the widest. Nothing picks it: a
+       * fragment program can carry several at once for the hardware to choose between, so these
+       * numbers describe one variant rather than the whole program. */
       const struct genisa_stats *widest = NULL;
 
       for (unsigned i = 0; i < ARRAY_SIZE(shader_data.stats); i++) {
@@ -706,11 +634,21 @@ s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, 
          stats->scratch_size = widest->scratch_memory_size;
          stats->shared_size = widest->workgroup_memory_size;
          stats->simd_width = widest->dispatch_width;
+
+         /* Only the variant carries these, so a stage brw reported no variant for keeps them 0. */
+         stats->instrs = widest->instrs;
+         stats->cycles = widest->cycles;
+         stats->spills = widest->spills;
+         stats->fills = widest->fills;
+         stats->sends = widest->sends;
+         stats->loops = widest->loops;
+         stats->max_live_registers = widest->max_live_registers;
       } else {
          stats->program_size = base_prog_data->program_size;
          stats->scratch_size = base_prog_data->total_scratch;
          stats->shared_size = base_prog_data->total_shared;
       }
+
       /* Dispatch width. Compute, task and mesh all report a valid-SIMD-variant mask (bit0=8, bit1=16,
        * bit2=32) in the brw_cs_prog_data they share; the ray tracing stages carry a plain width in
        * brw_bs_prog_data instead. The fixed-function graphics stages have no single dispatch width, so
@@ -749,9 +687,18 @@ s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, 
          }
       }
       fclose(cap);
+      cap = NULL;
    }
 
-   glsl_type_singleton_decref();
-   ralloc_free(mem_ctx);
-   return S2I_OK;
+   /* The one way out, success included. Nothing below is set until the step that produces it ran. */
+done:
+
+   if (cap)
+      fclose(cap);
+
+   if (layouts_built)
+      s2i_intel_anv_free_layouts(&layouts);
+
+   s2i_session_close(&session);
+   return result;
 }

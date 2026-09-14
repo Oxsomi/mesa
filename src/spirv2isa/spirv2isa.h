@@ -12,7 +12,7 @@
  * bridge, exactly like the dxc package.
  *
  * ONE API, MANY BACKENDS. Everything that means the same thing for every vendor lives here once:
- * the stage, the result, the descriptor bindings, the feature gate. Only what a vendor genuinely
+ * the stage, the result, the descriptor bindings, the pipeline state. Only what a vendor genuinely
  * owns carries its name: s2i_target_amd / s2i_target_intel (which architecture), s2i_stats_amd /
  * s2i_stats_intel (SGPRs and LDS vs GRFs and SLM) and s2i_rt_mode_amd (RADV's inlining taxonomy).
  * A caller picks a vendor by picking a target; s2i_compile dispatches on it.
@@ -34,84 +34,6 @@ extern "C" {
 #endif
 
 /*
- * The set of shader features a CALLER can declare, shared by every backend.
- *
- * These values are OWNED HERE. They deliberately do NOT mirror any other project's enum, and nothing
- * outside this file may assume they line up with one. A caller that has its own feature enum (OxC3 has
- * ESHExtension) TRANSLATES into these, and that translation belongs on the caller's side, next to the
- * enum it is translating from.
- *
- * That direction is the whole point. An earlier version of this gate mirrored ESHExtension bit values
- * directly: when a value was deleted there and a different feature took the freed bit, nothing failed to
- * build, and both backends silently began rejecting the new feature under the old feature's name. A
- * mirrored constant cannot notice that it went stale. Translating on the caller's side turns the same
- * change into a compile error at the translation, where whoever made it is already looking.
- *
- * Backends consume these; a feature the caller does not report simply is not gated. Values are stable
- * ABI: extend by appending, never renumber.
- */
-
-typedef enum s2i_feature {
-   S2I_FEATURE_RAY_QUERY            = 1u << 0,  /* inline ray tracing (rayQuery) in any stage */
-   S2I_FEATURE_RAY_MICROMAP_OPACITY = 1u << 1,  /* opacity micromap */
-   S2I_FEATURE_RAY_TRI_POSITION     = 1u << 2,  /* hit triangle vertex position fetch */
-   S2I_FEATURE_RAY_REORDER          = 1u << 3,  /* shader execution reorder (SER) */
-   S2I_FEATURE_BINDLESS             = 1u << 4,  /* dynamically indexed descriptor arrays */
-   S2I_FEATURE_DESCRIPTOR_HEAP      = 1u << 5,  /* SM6.6 style descriptor heap */
-   S2I_FEATURE_COOP_VECTOR          = 1u << 6,  /* NVIDIA cooperative vector */
-   S2I_FEATURE_COOP_VECTOR_TRAINING = 1u << 7,  /* NVIDIA cooperative vector training */
-   S2I_FEATURE_COOP_MATRIX          = 1u << 8,  /* KHR cooperative matrix */
-   S2I_FEATURE_COOP_FP8             = 1u << 9,  /* FP8 operands for the cooperative types */
-   S2I_FEATURE_MESH_TASK_TEX_DERIV  = 1u << 10, /* texture derivatives inside mesh / task */
-} s2i_feature;
-
-/* A caller-declared feature set, an OR of s2i_feature. 0 means "not declared", which leaves a backend
- * on its own thinner defences rather than gating anything. */
-typedef uint32_t s2i_features;
-
-/*
- * Reference for the caller side, which is where the translation belongs. OxC3 drops this next to
- * ESHExtension (include/formats/oiSH/sh_binaries.h) once it links this library:
- *
- *   s2i_features S2I_fromESHExtension(ESHExtension e) {
- *
- *       //Naming each enumerator is deliberate. Deleting one on the oiSH side then becomes a compile
- *       //error HERE, rather than leaving a stale bit number in the backend that quietly gates
- *       //whichever feature later inherits it.
- *
- *       static const struct { ESHExtension ext; s2i_features feature; } map[] = {
- *           { ESHExtension_RayQuery,           S2I_FEATURE_RAY_QUERY },
- *           { ESHExtension_RayMicromapOpacity, S2I_FEATURE_RAY_MICROMAP_OPACITY },
- *           { ESHExtension_RayTriPosition,     S2I_FEATURE_RAY_TRI_POSITION },
- *           { ESHExtension_RayReorder,         S2I_FEATURE_RAY_REORDER },
- *           { ESHExtension_Bindless,           S2I_FEATURE_BINDLESS },
- *           { ESHExtension_DescriptorHeap,     S2I_FEATURE_DESCRIPTOR_HEAP },
- *           { ESHExtension_CoopVec,            S2I_FEATURE_COOP_VECTOR },
- *           { ESHExtension_CoopVecTraining,    S2I_FEATURE_COOP_VECTOR_TRAINING },
- *           { ESHExtension_CoopMat,            S2I_FEATURE_COOP_MATRIX },
- *           { ESHExtension_CoopFP8,            S2I_FEATURE_COOP_FP8 },
- *           { ESHExtension_MeshTaskTexDeriv,   S2I_FEATURE_MESH_TASK_TEX_DERIV }
- *       };
- *
- *       //And ADDING one is caught here, because a new extension nobody classified must not silently
- *       //pass through a gate that has never seen it. Bump after deciding it needs no s2i_feature.
- *       _Static_assert(ESHExtension_Count == 26, "ESHExtension changed: update the s2i_feature map");
- *
- *       s2i_features f = 0;
- *
- *       for(U64 i = 0; i < sizeof(map) / sizeof(map[0]); ++i)
- *           if(e & map[i].ext)
- *               f |= map[i].feature;
- *
- *       return f;
- *   }
- *
- * Everything ESHExtension carries that is not in that table (F64, subgroup ops, Barycentrics, ...) is
- * simply not gated, which is the correct outcome: a backend only refuses what it has been shown to be
- * unable to compile.
- */
-
-/*
  * A target packs the vendor into its high 16 bits and that vendor's architecture into its low ones,
  * so every backend numbers its own architectures from 0 and appending to one vendor never renumbers
  * another. The vendor is 1 based, which leaves 0 as no target at all rather than a valid one.
@@ -120,6 +42,7 @@ typedef uint32_t s2i_features;
 typedef enum s2i_vendor {
    S2I_VENDOR_AMD = 1,
    S2I_VENDOR_INTEL,
+   S2I_VENDOR_NVIDIA,
    S2I_VENDOR_COUNT
 } s2i_vendor;
 
@@ -134,7 +57,7 @@ typedef enum s2i_target_amd {
    S2I_TARGET_GFX8_POLARIS10 = S2I_TARGET(S2I_VENDOR_AMD, 0), /* RX 580  (GCN4)  */
    S2I_TARGET_GFX9_VEGA10    = S2I_TARGET(S2I_VENDOR_AMD, 1), /* RX Vega (GCN5)  */
    S2I_TARGET_GFX10_NAVI10   = S2I_TARGET(S2I_VENDOR_AMD, 2), /* RX 5700 XT (RDNA1) */
-   S2I_TARGET_GFX10_3_NAVI21 = S2I_TARGET(S2I_VENDOR_AMD, 3), /* RDNA2 (6700 XT class) */
+   S2I_TARGET_GFX10_3_NAVI21 = S2I_TARGET(S2I_VENDOR_AMD, 3), /* RX 6800/6900 (RDNA2) */
    S2I_TARGET_GFX11_NAVI31   = S2I_TARGET(S2I_VENDOR_AMD, 4), /* RX 7900 XTX (RDNA3) */
    S2I_TARGET_GFX12_GFX1201  = S2I_TARGET(S2I_VENDOR_AMD, 5), /* RX 9070 XT (RDNA4) */
    S2I_TARGET_AMD_COUNT      = 6
@@ -150,8 +73,23 @@ typedef enum s2i_target_intel {
    S2I_TARGET_XE_MTL         = S2I_TARGET(S2I_VENDOR_INTEL, 4), /* Meteor Lake    (Xe-LPG, 0x7d40) */
    S2I_TARGET_XE2_LNL        = S2I_TARGET(S2I_VENDOR_INTEL, 5), /* Lunar Lake     (Xe2,    0x64a0) */
    S2I_TARGET_XE2_BMG        = S2I_TARGET(S2I_VENDOR_INTEL, 6), /* Arc B580 / BMG (Xe2,    0xe20b) */
-   S2I_TARGET_INTEL_COUNT    = 7
+   S2I_TARGET_INTEL_COUNT    = 7,
 } s2i_target_intel;
+
+/* NVIDIA, via Mesa's NVK/NAK: one flagship die per generation, mirroring the other vendors' lists.
+ * Maxwell is the floor as a scope choice (older hardware OxC3 does not target), not NAK's, whose
+ * encoders go back to Fermi. Datacenter dies (GA100, GH100, GB100) and SoCs are out, as their device
+ * shape diverges from the discrete-graphics one this models. */
+typedef enum s2i_target_nvidia {
+   S2I_TARGET_GM204 = S2I_TARGET(S2I_VENDOR_NVIDIA, 0), /* GTX 980     (Maxwell,   SM52)  */
+   S2I_TARGET_GP102 = S2I_TARGET(S2I_VENDOR_NVIDIA, 1), /* GTX 1080 Ti (Pascal,    SM61)  */
+   S2I_TARGET_TU102 = S2I_TARGET(S2I_VENDOR_NVIDIA, 2), /* RTX 2080 Ti (Turing,    SM75)  */
+   S2I_TARGET_GA102 = S2I_TARGET(S2I_VENDOR_NVIDIA, 3), /* RTX 3080/90 (Ampere,    SM86)  */
+   S2I_TARGET_AD102 = S2I_TARGET(S2I_VENDOR_NVIDIA, 4), /* RTX 4090    (Ada,       SM89)  */
+   S2I_TARGET_GB202 = S2I_TARGET(S2I_VENDOR_NVIDIA, 5), /* RTX 5090    (Blackwell, SM120) */
+
+   S2I_TARGET_NVIDIA_COUNT = 6,
+} s2i_target_nvidia;
 
 /* A target of any vendor. The per-vendor enums above are the values it takes; this is the type the
  * API speaks, so a caller holding a target never has to say which vendor it came from. */
@@ -200,9 +138,11 @@ typedef struct s2i_stats_amd {
    uint32_t code_size;                /* bytes */
    uint32_t lds_size, scratch_size;   /* bytes */
    uint32_t instructions;
+   uint32_t wave_size;                /* lanes per wave RADV chose for this shader: 32 or 64 */
 } s2i_stats_amd;
 
-/* Intel register and memory usage. */
+/* Intel register and memory usage, from the same genisa_stats a driver reports through
+ * VK_KHR_pipeline_executable_properties, so these numbers compare directly against that path. */
 typedef struct s2i_stats_intel {
    uint32_t grf_used;       /* GRF (general register file) registers used */
    uint32_t program_size;   /* bytes of EU machine code */
@@ -210,7 +150,29 @@ typedef struct s2i_stats_intel {
    uint32_t shared_size;    /* SLM / shared-local-memory bytes */
    uint32_t simd_width;     /* dispatch width (compute): 8 / 16 / 32 */
    uint32_t stack_size;     /* ray tracing: per-ray stack bytes, which scratch does not cover */
+   uint32_t instrs;         /* instructions in the final stream, nops and sync nops excluded */
+   uint32_t cycles;         /* the scheduler's estimated latency for one thread */
+   uint32_t spills, fills;  /* register spills to scratch, and their fills */
+   uint32_t sends;          /* send instructions: every memory and sampler message */
+   uint32_t loops;          /* loops in the final stream */
+   uint32_t max_live_registers; /* peak register pressure, what a spill is measured against */
 } s2i_stats_intel;
+
+/* NVIDIA register and memory usage, straight from NAK's own per-shader report. */
+typedef struct s2i_stats_nvidia {
+   uint32_t gprs;             /* general-purpose registers used */
+   uint32_t instrs;           /* instructions in the final stream */
+   uint64_t static_cycles;    /* cycles spent in fixed-latency instructions */
+   uint32_t spills_to_mem;    /* GPR spills to memory, and their fills */
+   uint32_t fills_from_mem;
+   uint32_t spills_to_reg;    /* spills between register files, and their fills */
+   uint32_t fills_from_reg;
+   uint32_t slm_size;         /* shader local (scratch) memory bytes */
+   uint32_t crs_size;         /* call/return stack bytes per warp */
+   uint32_t smem_size;        /* shared memory bytes (compute) */
+   uint32_t max_warps_per_sm; /* occupancy bound from static register/memory use */
+   uint32_t code_size;        /* bytes of SASS */
+} s2i_stats_nvidia;
 
 /*
  * What a compile reports back, for whichever vendor ran it. The three facts every backend measures
@@ -219,12 +181,13 @@ typedef struct s2i_stats_intel {
  */
 typedef struct s2i_stats {
    s2i_vendor vendor;             /* which member of the union below is live */
-   uint32_t code_size;            /* bytes of machine code (AMD code_size / Intel program_size) */
+   uint32_t code_size;            /* bytes of machine code (AMD / Intel / NVIDIA SASS) */
    uint32_t scratch_size;         /* bytes of scratch */
-   uint32_t shared_size;          /* bytes of on-chip shared memory (AMD LDS / Intel SLM) */
+   uint32_t shared_size;          /* bytes of on-chip shared memory (AMD LDS / Intel SLM / NVIDIA smem) */
    union {
       s2i_stats_amd amd;
       s2i_stats_intel intel;
+      s2i_stats_nvidia nvidia;
    };
 } s2i_stats;
 
@@ -245,7 +208,11 @@ typedef struct s2i_info {
    uint8_t rt_can_inline;      /* 1 if a whole-pipeline compile could inline this shader: raygen/any-hit/
                                 * intersection always, miss/closest-hit unless they recurse (traceRay),
                                 * callable never. 0 otherwise / not an RT shader. */
-   uint8_t graphics_specialized; /* 1 if a graphics PSO state was applied (baked-in), 0 = unlinked/dynamic */
+   uint8_t graphics_specialized; /* 1 when s2i_pipeline.graphics was applied, 0 when the stage
+                                  * compiled unlinked against the driver's dynamic defaults. */
+   char *notes;                /* malloc'd, caller frees; NULL when there were none. Prose the
+                                * compiler emitted, chiefly why a wider SIMD variant was rejected.
+                                * Read it, do not parse it. Intel only. */
 } s2i_info;
 
 typedef enum s2i_result {
@@ -258,39 +225,55 @@ typedef enum s2i_result {
 } s2i_result;
 
 /*
- * Compile one entrypoint of a SPIR-V module to ISA text (+ optional stats), for `target`, whose
- * vendor decides which backend runs.
+ * What the caller declares about the pipeline the module is compiled into, as opposed to the module
+ * itself. One struct for both entry points, so the two cannot drift, and so a caller names what it
+ * sets: everything left zero is "not declared", which each field documents the meaning of.
+ */
+typedef struct s2i_pipeline {
+
+   /* Which architecture to compile for, and so which backend runs. Required. */
+   s2i_target target;
+
+   /* Descriptor set layouts, indexed by set. NULL (or a count of 0) synthesizes a permissive
+    * layout from the module's own resources, which is the fallback for a quick test. A backend
+    * that builds a descriptor layout consumes these; one that places resources from the module's
+    * own decorations validates against them. Either way a binding the backend cannot lower is
+    * S2I_UNSUPPORTED_CAP rather than ISA that cannot bind. */
+   const VkDescriptorSetLayoutCreateInfo *const *set_layouts;
+   uint32_t set_layout_count;
+
+   /* Robust access, in the structure a Vulkan pipeline declares it with. Bounds checking moves
+    * every buffer and image access, so it is an input rather than an assumption; NULL is every
+    * access DISABLED, since a compile with no device has no device default to mean. */
+   const VkPipelineRobustnessCreateInfo *robustness;
+
+   /* The graphics pipeline this stage belongs to, as a Vulkan pipeline declares it. It describes
+    * the WHOLE pipeline (every stage, the render targets, the sample and tessellation state); the
+    * `stage` argument selects which of those stages to compile, so a create info naming only that
+    * one stage is refused. NULL compiles unlinked against the driver's dynamic defaults, which is
+    * what a shader-object compile does. Ignored for compute and ray tracing. */
+   const VkGraphicsPipelineCreateInfo *graphics;
+
+} s2i_pipeline;
+
+/*
+ * Compile one entrypoint of a SPIR-V module to ISA text (+ optional stats), for the pipeline's
+ * target, whose vendor decides which backend runs.
  * The caller (OxC3) supplies everything it already knows from the oiSH so this layer never has to
  * scan the SPIR-V: the entrypoint name, the stage, and the descriptor binding layout. That keeps it
  * thin and non-fragile.
  *   entry         : entrypoint name (required, OxC3 always has it).
  *   stage         : the pipeline stage (OxC3 maps ESHPipelineStage -> s2i_stage).
- *   set_layouts   : descriptor set layouts, indexed by set (may be NULL for none / a quick test, in
- *                   which case a permissive generic layout is synthesized as a fallback). A backend
- *                   that builds a descriptor layout consumes this; one that places resources from
- *                   the module's own decorations only validates it. Either way a module needing a
- *                   binding form the backend cannot lower is S2I_UNSUPPORTED_CAP rather than ISA
- *                   that cannot bind, and s2i_info reports where a lowering diverges from a driver.
- *   binding_count : number of entries in `bindings`.
- *   features_used : which features the module uses, as an OR of s2i_feature (above),
- *                   or 0 if not declared. The CALLER translates its own feature enum into these; OxC3
- *                   maps ESHExtension -> s2i_feature on its side, so that changing ESHExtension breaks
- *                   at that translation instead of silently re-pointing a bit here. This is the primary,
- *                   authoritative feature gate: a feature this target does not support (or that the
- *                   offline compiler has not wired yet) returns S2I_UNSUPPORTED_CAP with a clear
- *                   message BEFORE compiling, so it never crashes. Pass 0 to rely on the thinner
- *                   defensive SPIR-V-extension scan instead (what the CLI does).
+ *   pipeline      : what the caller declares about the pipeline (target, descriptor layouts,
+ *                   robust access). See s2i_pipeline.
  *   isa_text      : out, malloc'd disassembly text (caller frees) on S2I_OK.
  *   stats         : out, optional (may be NULL).
  *   info          : out, optional (may be NULL) compile facts: RT mode / inlinability / specialization.
  *   message       : out, optional diagnostic string on error, malloc'd (caller frees if non-NULL).
  */
 s2i_result s2i_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2i_stage stage,
-                       s2i_target target,
-                       const VkDescriptorSetLayoutCreateInfo *const *set_layouts,
-                       uint32_t set_layout_count,
-                       s2i_features features_used, char **isa_text, s2i_stats *stats, s2i_info *info,
-                       char **message);
+                       const s2i_pipeline *pipeline, char **isa_text, s2i_stats *stats,
+                       s2i_info *info, char **message);
 
 /* One shader of a ray tracing pipeline, for the whole-pipeline (monolithic) compile below. */
 typedef struct s2i_rt_shader {
@@ -314,15 +297,14 @@ typedef struct s2i_rt_shader {
  *   compile_traversal = 1: build and compile the pipeline's TRAVERSAL shader (the BVH walk that a
  *     non-monolithic / function-calls pipeline runs as a separate stage, called by the raygen);
  *     entry_index is ignored. Per-shader ISA for the others is s2i_compile (function-calls mode).
- * Each shader may use the same descriptor `bindings`. `features_used` is the feature set of the whole
- * PIPELINE (the union over its shaders), gated exactly as in s2i_compile.
+ * Every shader shares the one `pipeline`, as they do on a device: it is the pipeline's, not a
+ * stage's.
  * isa_text/stats/message as in s2i_compile.
  */
-s2i_result s2i_compile_rt_pipeline(const s2i_rt_shader *shaders, size_t shader_count, size_t entry_index,
-                                   int compile_traversal, s2i_target target,
-                                   const VkDescriptorSetLayoutCreateInfo *const *set_layouts,
-                                   uint32_t set_layout_count, s2i_features features_used, char **isa_text,
-                                   s2i_stats *stats, char **message);
+s2i_result s2i_compile_rt_pipeline(const s2i_rt_shader *shaders, size_t shader_count,
+                                   size_t entry_index, int compile_traversal,
+                                   const s2i_pipeline *pipeline, char **isa_text, s2i_stats *stats,
+                                   char **message);
 
 /*
  * Pre-flight feature check for a cross-vendor/-target support matrix, WITHOUT re-parsing SPIR-V:
@@ -339,7 +321,10 @@ const char *s2i_target_name(s2i_target target);
 /*
  * The short stable token a target is named by on a command line or in a file: "gfx1100", "dg2".
  * Unlike the human name it is one word, lowercase and never reworded, so it is what a caller stores
- * and what a golden file is keyed by. Static string, "" for no such target.
+ * and what a golden file is keyed by. Flagship tokens resolve even in a build without their
+ * vendor's backend; extended-tier tokens exist only when it is built, and an extended target's
+ * numeric value depends on the Mesa data the build carries, so the token, never the number, is the
+ * form to store. Static string, "" for no such target.
  * s2i_target_from_id is its inverse, case insensitive, returning 0 (no target) for an unknown token,
  * which is the whole point: a mistyped target is refused rather than silently becoming target 0.
  */
@@ -351,10 +336,16 @@ s2i_target s2i_target_from_id(const char *id);
 const char *s2i_stage_id(s2i_stage stage);
 int s2i_stage_from_id(const char *id);
 
-/* Every target this library was built with, in order, so a caller can list them without knowing
- * which backends are compiled in. Returns the count and fills `targets` when it is non-NULL and
+/* Every target this library can serve, in vendor order with each vendor's flagships first, so a
+ * caller can list them without knowing which backends are compiled in. For a built backend this
+ * includes the extended tier: every other device Mesa's own tables can model; for one that is not
+ * built only its flagships appear. Returns the count and fills `targets` when it is non-NULL and
  * `capacity` allows; pass NULL to ask for the count alone. */
 size_t s2i_targets(s2i_target *targets, size_t capacity);
+
+/* Whether `target` is one of the curated flagship targets above rather than the enumerated extended
+ * tier; a listing shows flagships by default. 0 for extended and for unknown targets. */
+int s2i_target_is_flagship(s2i_target target);
 
 /* Human-readable vendor name ("AMD", "Intel"), "" for no such vendor. */
 const char *s2i_vendor_name(s2i_vendor vendor);

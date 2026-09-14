@@ -4,9 +4,10 @@
  *
  * spirv2isa: the one public entry point, dispatching to whichever backend owns the target's vendor.
  *
- * Each backend is compiled in independently (S2I_HAVE_AMD / S2I_HAVE_INTEL, set by meson from the
- * spirv2isa_amd / spirv2isa_intel options), so a library built with one vendor still answers for the
- * other: it reports the vendor as absent and refuses its targets, rather than failing to link.
+ * Each backend is compiled in independently (S2I_HAVE_AMD / S2I_HAVE_INTEL / S2I_HAVE_NVIDIA, set
+ * by meson from the spirv2isa-backends list option), so a library built with a subset still answers
+ * for the rest: it reports a missing vendor as absent and refuses its targets, rather than failing
+ * to link.
  */
 #include "spirv2isa.h"
 
@@ -20,13 +21,18 @@
 #ifdef S2I_HAVE_INTEL
 #include "../intel/spirv2isa/spirv2isa_intel.h"
 #endif
+#ifdef S2I_HAVE_NVIDIA
+#include "../nouveau/spirv2isa/spirv2isa_nvk.h"
+#endif
 
 /*
- * Every target of every backend, in vendor then architecture order, each with the short token it is
- * named by. A vendor that isn't built stays in this table: it is what the target names and the
- * "built without that backend" refusal read.
+ * Every flagship target of every backend, in vendor then architecture order, each with the short
+ * token it is named by. A vendor that isn't built stays in this table: it is what the target names
+ * and the "built without that backend" refusal read.
  * The ids live here rather than in a backend because they are the cross-vendor vocabulary: one flat
  * namespace a caller types, stores and keys golden files by, so no two of them may collide.
+ * Extended-tier tokens come from the built backend that owns them; each vendor shapes its own (AMD
+ * family names, Intel PCI ids, NVIDIA die names), which keeps that namespace collision free too.
  */
 static const struct {
    s2i_target target;
@@ -45,7 +51,63 @@ static const struct {
    { S2I_TARGET_XE_MTL,         "mtl"     },
    { S2I_TARGET_XE2_LNL,        "lnl"     },
    { S2I_TARGET_XE2_BMG,        "bmg"     },
+
+   { S2I_TARGET_GM204, "gm204" },
+   { S2I_TARGET_GP102, "gp102" },
+   { S2I_TARGET_TU102, "tu102" },
+   { S2I_TARGET_GA102, "ga102" },
+   { S2I_TARGET_AD102, "ad102" },
+   { S2I_TARGET_GB202, "gb202" },
 };
+
+/*
+ * The extended tier: a built backend owns its full target list (flagships first, then every other
+ * device it can model); these adapters let the vendor-agnostic lookups below reach it. Both give the
+ * empty answer for a vendor that is not built, and the token adapter also returns "" for flagship
+ * indices, whose tokens live in s2i_all_targets above.
+ */
+static int
+s2i_vendor_target_count(s2i_vendor vendor)
+{
+   switch (vendor) {
+
+#ifdef S2I_HAVE_AMD
+   case S2I_VENDOR_AMD: return s2i_amd_target_count();
+#endif
+
+#ifdef S2I_HAVE_INTEL
+   case S2I_VENDOR_INTEL: return s2i_intel_target_count();
+#endif
+
+#ifdef S2I_HAVE_NVIDIA
+   case S2I_VENDOR_NVIDIA: return s2i_nvk_target_count();
+#endif
+
+   default: return 0;
+   }
+}
+
+static const char *
+s2i_vendor_target_token(s2i_vendor vendor, int target_index)
+{
+   switch (vendor) {
+
+#ifdef S2I_HAVE_AMD
+   case S2I_VENDOR_AMD: return s2i_amd_target_token(target_index);
+#endif
+
+#ifdef S2I_HAVE_INTEL
+   case S2I_VENDOR_INTEL: return s2i_intel_target_token(target_index);
+#endif
+
+#ifdef S2I_HAVE_NVIDIA
+   case S2I_VENDOR_NVIDIA: return s2i_nvk_target_token(target_index);
+#endif
+
+   default: return "";
+   }
+}
+
 
 static const char *s2i_stage_ids[S2I_STAGE_COUNT] = {
    [S2I_STAGE_VERTEX]       = "vs",
@@ -102,14 +164,21 @@ s2i_check_target(s2i_target target, char **message)
 
 #ifdef S2I_HAVE_AMD
    case S2I_VENDOR_AMD:
-      if (S2I_TARGET_INDEX_OF(target) >= 0 && S2I_TARGET_INDEX_OF(target) < S2I_TARGET_AMD_COUNT)
+      if (S2I_TARGET_INDEX_OF(target) >= 0 && S2I_TARGET_INDEX_OF(target) < s2i_amd_target_count())
          return S2I_OK;
       break;
 #endif
 
 #ifdef S2I_HAVE_INTEL
    case S2I_VENDOR_INTEL:
-      if (S2I_TARGET_INDEX_OF(target) >= 0 && S2I_TARGET_INDEX_OF(target) < S2I_TARGET_INTEL_COUNT)
+      if (S2I_TARGET_INDEX_OF(target) >= 0 && S2I_TARGET_INDEX_OF(target) < s2i_intel_target_count())
+         return S2I_OK;
+      break;
+#endif
+
+#ifdef S2I_HAVE_NVIDIA
+   case S2I_VENDOR_NVIDIA:
+      if (S2I_TARGET_INDEX_OF(target) >= 0 && S2I_TARGET_INDEX_OF(target) < s2i_nvk_target_count())
          return S2I_OK;
       break;
 #endif
@@ -147,6 +216,12 @@ s2i_stats_fill_shared(s2i_stats *stats)
       stats->shared_size = stats->intel.shared_size;
       break;
 
+   case S2I_VENDOR_NVIDIA:
+      stats->code_size = stats->nvidia.code_size;
+      stats->scratch_size = stats->nvidia.slm_size;
+      stats->shared_size = stats->nvidia.smem_size;
+      break;
+
    default:
       break;
    }
@@ -154,11 +229,13 @@ s2i_stats_fill_shared(s2i_stats *stats)
 
 s2i_result
 s2i_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2i_stage stage,
-            s2i_target target, const VkDescriptorSetLayoutCreateInfo *const *set_layouts,
-                             uint32_t set_layout_count,
-            s2i_features features_used, char **isa_text, s2i_stats *stats, s2i_info *info,
+            const s2i_pipeline *pipeline, char **isa_text, s2i_stats *stats, s2i_info *info,
             char **message)
 {
+   if (!pipeline)
+      return S2I_BAD_TARGET;
+
+   const s2i_target target = pipeline->target;
    const s2i_result targetResult = s2i_check_target(target, message);
 
    if (targetResult != S2I_OK)
@@ -166,9 +243,9 @@ s2i_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2i_st
 
    s2i_result result = S2I_BAD_TARGET;
 
-#if !defined(S2I_HAVE_AMD) && !defined(S2I_HAVE_INTEL)
-   (void)spirv; (void)spirv_words; (void)entry; (void)stage; (void)set_layouts; (void)set_layout_count;
-   (void)features_used; (void)isa_text; (void)info;
+#if !defined(S2I_HAVE_AMD) && !defined(S2I_HAVE_INTEL) && !defined(S2I_HAVE_NVIDIA)
+   (void)spirv; (void)spirv_words; (void)entry; (void)stage; (void)pipeline; (void)isa_text;
+   (void)info;
 #endif
 
    /* The backend fills its own half of the stats; the shared half is derived from it afterwards, so
@@ -183,9 +260,9 @@ s2i_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2i_st
 
 #ifdef S2I_HAVE_AMD
    case S2I_VENDOR_AMD:
-      result = s2i_amd_compile(spirv, spirv_words, entry, stage, S2I_TARGET_INDEX_OF(target), set_layouts,
-                               set_layout_count, features_used, isa_text, stats ? &stats->amd : NULL, info,
-                               message);
+      result = s2i_amd_compile(spirv, spirv_words, entry, stage, S2I_TARGET_INDEX_OF(target),
+                               pipeline, isa_text,
+                               stats ? &stats->amd : NULL, info, message);
       break;
 #endif
 
@@ -198,9 +275,23 @@ s2i_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2i_st
       if (info)
          memset(info, 0, sizeof(*info));
 
-      result = s2i_intel_compile(spirv, spirv_words, entry, stage, S2I_TARGET_INDEX_OF(target), set_layouts,
-                                 set_layout_count, features_used, isa_text, stats ? &stats->intel : NULL,
-                                 info, message);
+      result = s2i_intel_compile(spirv, spirv_words, entry, stage, S2I_TARGET_INDEX_OF(target),
+                                 pipeline, isa_text,
+                                 stats ? &stats->intel : NULL, info, message);
+      break;
+#endif
+
+#ifdef S2I_HAVE_NVIDIA
+   case S2I_VENDOR_NVIDIA:
+
+      /* The NVIDIA backend fills no compile facts yet, so they read as zeroed rather than stale. */
+
+      if (info)
+         memset(info, 0, sizeof(*info));
+
+      result = s2i_nvk_compile(spirv, spirv_words, entry, stage, S2I_TARGET_INDEX_OF(target),
+                               pipeline, isa_text,
+                               stats ? &stats->nvidia : NULL, info, message);
       break;
 #endif
 
@@ -216,10 +307,13 @@ s2i_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2i_st
 
 s2i_result
 s2i_compile_rt_pipeline(const s2i_rt_shader *shaders, size_t shader_count, size_t entry_index,
-                        int compile_traversal, s2i_target target, const VkDescriptorSetLayoutCreateInfo *const *set_layouts,
-                             uint32_t set_layout_count, s2i_features features_used, char **isa_text,
+                        int compile_traversal, const s2i_pipeline *pipeline, char **isa_text,
                         s2i_stats *stats, char **message)
 {
+   if (!pipeline)
+      return S2I_BAD_TARGET;
+
+   const s2i_target target = pipeline->target;
    const s2i_result targetResult = s2i_check_target(target, message);
 
    if (targetResult != S2I_OK)
@@ -231,16 +325,16 @@ s2i_compile_rt_pipeline(const s2i_rt_shader *shaders, size_t shader_count, size_
    }
 
 #ifndef S2I_HAVE_AMD
-   (void)shaders; (void)shader_count; (void)entry_index; (void)compile_traversal; (void)set_layouts;
-   (void)set_layout_count; (void)features_used; (void)isa_text;
+   (void)shaders; (void)shader_count; (void)entry_index; (void)compile_traversal; (void)pipeline;
+   (void)isa_text;
 #endif
 
 #ifdef S2I_HAVE_AMD
    if (S2I_TARGET_VENDOR_OF(target) == S2I_VENDOR_AMD) {
 
       const s2i_result result = s2i_amd_compile_rt_pipeline(
-         shaders, shader_count, entry_index, compile_traversal, S2I_TARGET_INDEX_OF(target), set_layouts,
-         set_layout_count, features_used, isa_text, stats ? &stats->amd : NULL, message);
+         shaders, shader_count, entry_index, compile_traversal, S2I_TARGET_INDEX_OF(target),
+         pipeline, isa_text, stats ? &stats->amd : NULL, message);
 
       if (result == S2I_OK && stats)
          s2i_stats_fill_shared(stats);
@@ -250,14 +344,16 @@ s2i_compile_rt_pipeline(const s2i_rt_shader *shaders, size_t shader_count, size_
 #endif
 
    /* The target is real, the operation is not wired for it: only RADV's traversal + inlining model is
-    * implemented so far. Compiling the pipeline's shaders ONE AT A TIME works on every backend that
-    * has ray tracing (Intel compiles all six RT stages through brw_compile_bs), so that is what the
-    * message points at rather than leaving the caller with a dead end. */
+    * implemented so far. Intel compiles RT stages one at a time through s2i_compile, so its message
+    * points there; NVIDIA refuses RT stages entirely, so its message must not. */
 
-   if (message)
-      *message = s2i_message(
-         "this backend has no whole-pipeline ray tracing compile yet; compile each shader with "
-         "s2i_compile instead");
+   if (message) {
+      *message = S2I_TARGET_VENDOR_OF(target) == S2I_VENDOR_NVIDIA ?
+         s2i_message("ray tracing is not wired on the NVIDIA backend yet") :
+         s2i_message(
+            "this backend has no whole-pipeline ray tracing compile yet; compile each shader with "
+            "s2i_compile instead");
+   }
 
    return S2I_UNSUPPORTED_CAP;
 }
@@ -267,7 +363,7 @@ s2i_unsupported_caps(const uint32_t *caps_used, size_t caps_count, s2i_target ta
 {
 #ifdef S2I_HAVE_AMD
    if (S2I_TARGET_VENDOR_OF(target) == S2I_VENDOR_AMD &&
-       S2I_TARGET_INDEX_OF(target) >= 0 && S2I_TARGET_INDEX_OF(target) < S2I_TARGET_AMD_COUNT)
+       S2I_TARGET_INDEX_OF(target) >= 0 && S2I_TARGET_INDEX_OF(target) < s2i_amd_target_count())
       return s2i_amd_unsupported_caps(caps_used, caps_count, S2I_TARGET_INDEX_OF(target));
 #else
    (void)caps_used;
@@ -275,7 +371,7 @@ s2i_unsupported_caps(const uint32_t *caps_used, size_t caps_count, s2i_target ta
 #endif
 
    /* A backend without its own capability matrix reports nothing unsupported here; s2i_compile's
-    * feature gate is the authoritative check either way. */
+    * declared-capability gate is the authoritative check either way. */
 
    (void)target;
    return NULL;
@@ -296,6 +392,11 @@ s2i_target_name(s2i_target target)
       return s2i_intel_target_name(S2I_TARGET_INDEX_OF(target));
 #endif
 
+#ifdef S2I_HAVE_NVIDIA
+   case S2I_VENDOR_NVIDIA:
+      return s2i_nvk_target_name(S2I_TARGET_INDEX_OF(target));
+#endif
+
    default:
       break;
    }
@@ -306,13 +407,42 @@ s2i_target_name(s2i_target target)
 size_t
 s2i_targets(s2i_target *targets, size_t capacity)
 {
-   const size_t count = sizeof(s2i_all_targets) / sizeof(s2i_all_targets[0]);
+   const size_t static_count = sizeof(s2i_all_targets) / sizeof(s2i_all_targets[0]);
+   size_t n = 0;
 
-   if (targets)
-      for (size_t i = 0; i < count && i < capacity; ++i)
-         targets[i] = s2i_all_targets[i].target;
+   for (int vendor = 1; vendor < S2I_VENDOR_COUNT; ++vendor) {
 
-   return count;
+      const int built_count = s2i_vendor_target_count((s2i_vendor)vendor);
+
+      if (built_count > 0) {
+         for (int i = 0; i < built_count; ++i, ++n)
+            if (targets && n < capacity)
+               targets[n] = S2I_TARGET(vendor, i);
+         continue;
+      }
+
+      for (size_t i = 0; i < static_count; ++i)
+         if ((int)S2I_TARGET_VENDOR_OF(s2i_all_targets[i].target) == vendor) {
+            if (targets && n < capacity)
+               targets[n] = s2i_all_targets[i].target;
+            ++n;
+         }
+   }
+
+   return n;
+}
+
+int
+s2i_target_is_flagship(s2i_target target)
+{
+   const int index = S2I_TARGET_INDEX_OF(target);
+
+   switch (S2I_TARGET_VENDOR_OF(target)) {
+   case S2I_VENDOR_AMD:    return index >= 0 && index < (int)S2I_TARGET_AMD_COUNT;
+   case S2I_VENDOR_INTEL:  return index >= 0 && index < (int)S2I_TARGET_INTEL_COUNT;
+   case S2I_VENDOR_NVIDIA: return index >= 0 && index < (int)S2I_TARGET_NVIDIA_COUNT;
+   default:                return 0;
+   }
 }
 
 const char *
@@ -323,6 +453,13 @@ s2i_target_id(s2i_target target)
    for (size_t i = 0; i < count; ++i)
       if (s2i_all_targets[i].target == target)
          return s2i_all_targets[i].id;
+
+   {
+      const char *token = s2i_vendor_target_token(S2I_TARGET_VENDOR_OF(target), S2I_TARGET_INDEX_OF(target));
+
+      if (token[0])
+         return token;
+   }
 
    return "";
 }
@@ -338,6 +475,19 @@ s2i_target_from_id(const char *id)
    for (size_t i = 0; i < count; ++i)
       if (s2i_id_equals(id, s2i_all_targets[i].id))
          return s2i_all_targets[i].target;
+
+   for (int vendor = 1; vendor < S2I_VENDOR_COUNT; ++vendor) {
+
+      const int built_count = s2i_vendor_target_count((s2i_vendor)vendor);
+
+      for (int i = 0; i < built_count; ++i) {
+
+         const char *token = s2i_vendor_target_token((s2i_vendor)vendor, i);
+
+         if (token[0] && s2i_id_equals(id, token))
+            return S2I_TARGET(vendor, i);
+      }
+   }
 
    return 0;
 }
@@ -370,6 +520,7 @@ s2i_vendor_name(s2i_vendor vendor)
    switch (vendor) {
    case S2I_VENDOR_AMD:   return "AMD";
    case S2I_VENDOR_INTEL: return "Intel";
+   case S2I_VENDOR_NVIDIA: return "NVIDIA";
    default:               return "";
    }
 }
@@ -385,6 +536,10 @@ s2i_has_vendor(s2i_vendor vendor)
 
 #ifdef S2I_HAVE_INTEL
    case S2I_VENDOR_INTEL: return 1;
+#endif
+
+#ifdef S2I_HAVE_NVIDIA
+   case S2I_VENDOR_NVIDIA: return 1;
 #endif
 
    default:               return 0;

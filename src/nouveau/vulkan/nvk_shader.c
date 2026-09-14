@@ -536,6 +536,78 @@ nvk_lower_nir_late(nir_shader *nir, VkShaderCreateFlagsEXT shader_flags)
    }
 }
 
+#ifdef NVK_SHADER_LOWER_NIR_ONLY
+
+/* Defined below, in the guard hole the offline build keeps. */
+static void nir_opts(nir_shader *nir, void *data);
+
+/*
+ * Entry points for the offline compiler (spirv2isa), which drives the statics above the way the
+ * driver below this guard drives them for a real pipeline: the option hooks, the fs key and the
+ * lowering, including the xfb and varying steps the compile hook runs between lower and lower_late.
+ * NAK returns its disassembly and stats in the compile result, so the compile call itself needs no
+ * shim.
+ */
+
+const struct nir_shader_compiler_options *
+nvk_shader_offline_nir_options(struct vk_physical_device *device, mesa_shader_stage stage,
+                               const struct vk_pipeline_robustness_state *rs)
+{
+   return nvk_get_nir_options(device, stage, rs);
+}
+
+struct spirv_to_nir_options
+nvk_shader_offline_spirv_options(struct vk_physical_device *device, mesa_shader_stage stage,
+                                 const struct vk_pipeline_robustness_state *rs)
+{
+   return nvk_get_spirv_options(device, stage, rs);
+}
+
+void
+nvk_shader_offline_preprocess(struct vk_physical_device *device, nir_shader *nir,
+                              const struct vk_pipeline_robustness_state *rs)
+{
+   nvk_preprocess_nir(device, nir, rs);
+}
+
+void
+nvk_shader_offline_lower(struct nvk_device *dev, nir_shader *nir,
+                         VkShaderCreateFlagsEXT shader_flags,
+                         const struct vk_pipeline_robustness_state *rs,
+                         uint32_t set_layout_count,
+                         struct vk_descriptor_set_layout *const *set_layouts,
+                         struct nvk_cbuf_map *cbuf_map_out)
+{
+   nvk_lower_nir(dev, nir, shader_flags, rs, set_layout_count, set_layouts, cbuf_map_out);
+
+   if (nir->xfb_info) {
+      /* Fold constant offset srcs for IO. */
+      NIR_PASS(_, nir, nir_opt_constant_folding);
+
+      nir_io_add_intrinsic_xfb_info(nir);
+   }
+
+   nir_opt_varyings_bulk(&nir, 1, true, UINT32_MAX, UINT32_MAX, nir_opts, NULL);
+
+   nvk_lower_nir_late(nir, shader_flags);
+}
+
+void
+nvk_shader_offline_fs_key(struct nak_fs_key *key, const struct vk_graphics_pipeline_state *state)
+{
+   nvk_populate_fs_key(key, state);
+}
+
+#endif /* NVK_SHADER_LOWER_NIR_ONLY */
+
+/*
+ * Everything above is a pure function of the physical device and the shader: the option hooks,
+ * the lowering and its helpers. Compiling this file with NVK_SHADER_LOWER_NIR_ONLY stops here,
+ * so an offline compiler can drive it without the driver below: uploads, the shader cache and
+ * the object machinery.
+ */
+#ifndef NVK_SHADER_LOWER_NIR_ONLY
+
 #ifndef NDEBUG
 static void
 nvk_shader_dump(struct nvk_shader *shader)
@@ -1230,6 +1302,10 @@ nvk_compile_nir_shader(struct nvk_device *dev, nir_shader *nir,
    return VK_SUCCESS;
 }
 
+/* Device-free, so the offline lowering can run the same varying optimization the compile hook
+ * runs; the guard reopens right after. */
+#endif /* NVK_SHADER_LOWER_NIR_ONLY */
+
 static void
 nir_opts(nir_shader *nir, void *data)
 {
@@ -1261,6 +1337,8 @@ nir_opts(nir_shader *nir, void *data)
       NIR_PASS(progress, nir, nir_opt_loop_unroll);
    } while (progress);
 }
+
+#ifndef NVK_SHADER_LOWER_NIR_ONLY
 
 static VkResult
 nvk_compile_shaders(struct vk_device *vk_dev,
@@ -1675,3 +1753,5 @@ const struct vk_device_shader_ops nvk_device_shader_ops = {
    .cmd_set_dynamic_graphics_state = vk_cmd_set_dynamic_graphics_state,
    .cmd_bind_shaders = nvk_cmd_bind_shaders,
 };
+
+#endif /* NVK_SHADER_LOWER_NIR_ONLY */

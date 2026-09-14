@@ -311,6 +311,17 @@ init_shared_mem_sizes(struct nv_device_info *info)
    }
 }
 
+void
+nv_device_info_from_chipset(struct nv_device_info *info, uint16_t chipset)
+{
+   info->chipset = chipset;
+   info->sm = sm_for_chipset(chipset);
+   info->mp_per_tpc = mp_per_tpc_for_chipset(chipset);
+   info->max_warps_per_mp = max_warps_per_mp_for_sm(info->sm);
+
+   init_shared_mem_sizes(info);
+}
+
 static int
 nouveau_ws_param(int fd, uint64_t param, uint64_t *value)
 {
