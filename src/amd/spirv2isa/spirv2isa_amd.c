@@ -46,6 +46,7 @@
 #include "spirv2isa_caps.h"             /* the shared declared-capability gate */
 #include "spirv2isa_state.h"            /* the pipeline state a module does not carry */
 #include "spirv2isa_session.h"          /* the generic setup and its one teardown */
+#include "spirv2isa_layout.h"           /* the descriptor layout resolve every backend shares */
 #include "radv_shader.h"                /* radv_compiler_info, radv_shader_stage, radv_get_nir_options, ... */
 #include "radv_shader_args.h"           /* radv_declare_shader_args (ray tracing path) */
 #include "radv_shader_info.h"           /* radv_nir_shader_info_init/pass (ray tracing path) */
@@ -322,30 +323,112 @@ s2i_build_fed_layout(const VkDescriptorSetLayoutCreateInfo *const *set_layouts,
    return true;
 }
 
-/* Fallback when the caller passes no layouts: one set of plain storage buffers repeated for every
- * set. This is a placeholder, NOT the module's layout. A binding the module uses as anything else
- * is described wrongly, and since offsets reach the ISA the code differs from what the real layout
- * produces. Intel and NVK synthesize the module's own layout instead; docs/roadmap.md tracks doing
- * the same here. */
+/* Every set an empty layout, which is what the discovery parse below compiles against. It cannot be
+ * a zeroed radv_shader_layout: radv_shader_spirv_to_nir looks a Ycbcr conversion up through
+ * layout->set[s].layout and dereferences it without a NULL check, so the sets have to exist before
+ * the descriptors they will hold are known. */
 static bool
-s2i_build_generic_layout(struct radv_shader_layout *layout, void *mem_ctx)
+s2i_build_empty_layout(struct radv_shader_layout *layout, void *mem_ctx)
 {
-   const uint32_t nbind = 64;
-   struct radv_descriptor_set_layout *dsl = s2i_alloc_set_layout(nbind, mem_ctx);
-   if (!dsl)
+   struct radv_descriptor_set_layout *empty = s2i_alloc_set_layout(0, mem_ctx);
+
+   if (!empty)
       return false;
-   dsl->binding_count = nbind;
-   dsl->size = nbind * 32;
-   for (uint32_t i = 0; i < nbind; i++) {
-      dsl->binding[i].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-      dsl->binding[i].array_size = 1;
-      dsl->binding[i].offset = i * 32;
-      dsl->binding[i].size = 32;
-   }
+
    layout->num_sets = MAX_SETS;
+
    for (uint32_t s = 0; s < MAX_SETS; s++)
-      layout->set[s].layout = dsl;
+      layout->set[s].layout = empty;
+
    return true;
+}
+
+/* Parse one module for layout discovery, and throw the result away: only the module says which
+ * descriptors it uses, and the layout has to be complete before the compile that reads it starts.
+ * Handing this NIR back through stage->internal_nir would save the second parse but lower twice,
+ * since that branch rejoins the same tail this one already ran. */
+static nir_shader *
+s2i_discovery_nir(struct radv_compiler_info *ci, const struct radv_shader_layout *empty,
+                  const uint32_t *spirv, size_t spirv_words, const char *entry,
+                  mesa_shader_stage ms)
+{
+   struct radv_shader_stage st;
+   memset(&st, 0, sizeof(st));
+   st.stage = ms;
+   st.spirv.data = (const char *)spirv;
+   st.spirv.size = spirv_words * 4;
+   st.entrypoint = entry;
+   st.layout = *empty;
+
+   return radv_shader_spirv_to_nir(ci, &st, NULL, false);
+}
+
+/* The layout the given shaders compile against: the caller's own where it declared one, checked
+ * against what the modules really reference, and otherwise synthesized from them through the shared
+ * resolve every backend uses. */
+static s2i_result
+s2i_amd_resolve_layout(struct radv_compiler_info *ci, const s2i_rt_shader *shaders,
+                       size_t shader_count, const s2i_pipeline *pipeline,
+                       struct radv_shader_layout *layout, void *mem_ctx, char **message)
+{
+   struct radv_shader_layout empty;
+   memset(&empty, 0, sizeof(empty));
+
+   nir_shader **nirs = calloc(shader_count ? shader_count : 1, sizeof(*nirs));
+
+   if (!nirs || !s2i_build_empty_layout(&empty, mem_ctx)) {
+
+      if (message)
+         *message = strdup("descriptor layout allocation failed");
+
+      free(nirs);
+      return S2I_COMPILE_FAILED;
+   }
+
+   s2i_result result = S2I_OK;
+   size_t parsed = 0;
+
+   for (; parsed < shader_count; parsed++) {
+
+      nirs[parsed] = s2i_discovery_nir(ci, &empty, shaders[parsed].spirv,
+                                       shaders[parsed].spirv_words, shaders[parsed].entry,
+                                       s2i_stage_to_mesa(shaders[parsed].stage));
+
+      if (!nirs[parsed]) {
+
+         if (message)
+            *message = strdup("vtn could not parse the module for this entrypoint");
+
+         result = S2I_NO_ENTRYPOINT;
+         break;
+      }
+   }
+
+   const VkDescriptorSetLayoutCreateInfo *const *eff_layouts = NULL;
+   uint32_t eff_layout_count = 0;
+
+   if (result == S2I_OK)
+      result = s2i_resolve_layouts(nirs, (uint32_t)shader_count, MAX_SETS, pipeline->set_layouts,
+                                   pipeline->set_layout_count, mem_ctx, &eff_layouts,
+                                   &eff_layout_count, message);
+
+   for (size_t i = 0; i < parsed; i++)
+      ralloc_free(nirs[i]);
+
+   free(nirs);
+
+   if (result != S2I_OK)
+      return result;
+
+   if (!s2i_build_fed_layout(eff_layouts, eff_layout_count, layout, mem_ctx)) {
+
+      if (message)
+         *message = strdup("descriptor layout allocation failed");
+
+      return S2I_COMPILE_FAILED;
+   }
+
+   return S2I_OK;
 }
 
 /* --- common device-free compiler setup ------------------------------------------------------ */
@@ -789,18 +872,23 @@ s2i_amd_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2
       }
    }
 
-   /* Descriptor layout: caller-fed if provided (the precise path), else a generic fallback. */
+   /* The descriptor layout this module compiles against. Its offsets and sizes reach the ISA, so a
+    * layout that is not the pipeline's produces code that resolves to the wrong descriptor. */
    struct radv_shader_layout layout;
    memset(&layout, 0, sizeof(layout));
 
-   if (!((pipeline->set_layouts && pipeline->set_layout_count)
-            ? s2i_build_fed_layout(pipeline->set_layouts, pipeline->set_layout_count, &layout,
-                                   session.mem_ctx)
-            : s2i_build_generic_layout(&layout, session.mem_ctx))) {
-      if (message)
-         *message = strdup("descriptor layout allocation failed");
-      result = S2I_COMPILE_FAILED;
-      goto done;
+   {
+      const s2i_rt_shader self = {
+         .spirv = spirv,
+         .spirv_words = spirv_words,
+         .entry = entry,
+         .stage = stage,
+      };
+
+      result = s2i_amd_resolve_layout(&ci, &self, 1, pipeline, &layout, session.mem_ctx, message);
+
+      if (result != S2I_OK)
+         goto done;
    }
 
    /* RADV carries robustness as stage key bits, so it reaches the compile through whichever stage
@@ -1087,15 +1175,12 @@ s2i_amd_compile_rt_pipeline(const s2i_rt_shader *shaders, size_t shader_count, s
       goto cleanup;
    }
 
-   if (!((pipeline->set_layouts && pipeline->set_layout_count)
-            ? s2i_build_fed_layout(pipeline->set_layouts, pipeline->set_layout_count, &layout,
-                                   session.mem_ctx)
-            : s2i_build_generic_layout(&layout, session.mem_ctx))) {
-      if (message)
-         *message = strdup("descriptor layout allocation failed");
-      result = S2I_COMPILE_FAILED;
+   /* One layout for the whole pipeline, resolved from every shader in it. */
+   result = s2i_amd_resolve_layout(&ci, shaders, shader_count, pipeline, &layout, session.mem_ctx,
+                                   message);
+
+   if (result != S2I_OK)
       goto cleanup;
-   }
 
    /* Front half for every shader: NIR + payload/attrib sizing; serialize callees into stage handles;
     * build the groups. Each shader becomes one group (general for raygen/miss/callable, a hit group

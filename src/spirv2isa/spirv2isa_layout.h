@@ -1,13 +1,14 @@
-/* Copyright 2026 Oxsomi / Nielsbishere SPDX-License-Identifier: MIT The descriptor layout a module
- * is compiled against, shared by every backend, INTERNAL. Two jobs, one walk: supplied layouts are
- * checked against the module, so a binding the caller did not describe is refused by name rather
- * than corrupting a lowering two steps later, and no layouts at all synthesizes one from the
- * module, which is the fallback the public API promises. Both the resource variables and the
- * vulkan_resource_index intrinsics count. The intrinsic is all that survives for a descriptor
- * whose variable a preprocess already consumed (ray query does this to the acceleration
- * structure), and the driver lowering reads the intrinsics, so a variables-only walk would miss
- * exactly the entries that lowering asks for. The vendors differ only in where they cap sets,
- * which is why this is one implementation. What each does with the result stays its own. */
+/* Copyright 2026 Oxsomi / Nielsbishere SPDX-License-Identifier: MIT The descriptor layout the
+ * shaders of one pipeline are compiled against, shared by every backend, INTERNAL. Two jobs, one
+ * walk: supplied layouts are checked against the modules, so a binding the caller did not
+ * describe is refused by name rather than corrupting a lowering two steps later, and no layouts
+ * at all synthesizes one from them, which is the fallback the public API promises. Both the
+ * resource variables and the vulkan_resource_index intrinsics count. The intrinsic is all that
+ * survives for a descriptor whose variable a preprocess already consumed (ray query does this to
+ * the acceleration structure), and the driver lowering reads the intrinsics, so a variables-only
+ * walk would miss exactly the entries that lowering asks for. The vendors differ only in where
+ * they cap sets, which is why this is one implementation. What each does with the result stays
+ * its own. */
 #ifndef SPIRV2ISA_LAYOUT_H
 #define SPIRV2ISA_LAYOUT_H
 
@@ -125,7 +126,7 @@ s2i_note_descriptor(const VkDescriptorSetLayoutCreateInfo *const *set_layouts,
  * count of 1, and an intrinsic names its own descriptor type where no variable is left to infer
  * one from. */
 static inline void
-s2i_place_bindings(nir_shader *nir, VkDescriptorSetLayoutCreateInfo *infos)
+s2i_place_bindings_one(nir_shader *nir, VkDescriptorSetLayoutCreateInfo *infos)
 {
    nir_foreach_variable_with_modes(var, nir, S2I_RESOURCE_MODES) {
       VkDescriptorSetLayoutCreateInfo *info = &infos[var->data.descriptor_set];
@@ -190,13 +191,66 @@ s2i_place_bindings(nir_shader *nir, VkDescriptorSetLayoutCreateInfo *infos)
    }
 }
 
+/* The shaders of one pipeline place into one set of infos, so a binding two of them share becomes
+ * one entry. */
+static inline void
+s2i_place_bindings(nir_shader *const *nirs, uint32_t nir_count,
+                   VkDescriptorSetLayoutCreateInfo *infos)
+{
+   for (uint32_t n = 0; n < nir_count; n++)
+      s2i_place_bindings_one(nirs[n], infos);
+}
+
+/* Every descriptor one shader references, checked against a supplied layout or counted into the
+ * synthesis. */
+static inline bool
+s2i_note_shader(nir_shader *nir, const VkDescriptorSetLayoutCreateInfo *const *set_layouts,
+                uint32_t set_layout_count, uint32_t max_sets, bool synthesize, uint32_t *nbind,
+                uint32_t *highest_set, bool *any, char **message)
+{
+   nir_foreach_variable_with_modes(var, nir, S2I_RESOURCE_MODES) {
+      const uint32_t aoa = glsl_get_aoa_size(var->type);
+
+      if (!s2i_note_descriptor(set_layouts, set_layout_count, max_sets, synthesize,
+                               var->data.descriptor_set, var->data.binding, aoa ? aoa : 1, nbind,
+                               highest_set, any, message))
+         return false;
+   }
+
+   /* The intrinsic carries no array size, so its count is 1 and a variable's richer count wins
+    * where both describe the same binding. */
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+
+            nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+
+            if (intrin->intrinsic != nir_intrinsic_vulkan_resource_index)
+               continue;
+
+            if (!s2i_note_descriptor(set_layouts, set_layout_count, max_sets, synthesize,
+                                     nir_intrinsic_desc_set(intrin), nir_intrinsic_binding(intrin),
+                                     1, nbind, highest_set, any, message))
+               return false;
+         }
+      }
+   }
+
+   return true;
+}
+
 /*
- * Resolve what the module is compiled against. `max_sets` is the caller's own set limit (at most
- * S2I_MAX_SETS). On S2I_OK, *out_layouts / *out_count are either the caller's own layouts unchanged
- * or a synthesized set owned by `mem_ctx`; otherwise *message names what could not be resolved.
+ * Resolve what `nir_count` shaders are compiled against. They resolve together because the shaders
+ * of one pipeline share one layout, so a set one of them never touches is still sized by whichever
+ * one does. `max_sets` is the caller's own set limit (at most S2I_MAX_SETS). On S2I_OK,
+ * *out_layouts / *out_count are either the caller's own layouts unchanged or a synthesized set
+ * owned by `mem_ctx`; otherwise *message names what could not be resolved.
  */
 static inline s2i_result
-s2i_resolve_layouts(nir_shader *nir, uint32_t max_sets,
+s2i_resolve_layouts(nir_shader *const *nirs, uint32_t nir_count, uint32_t max_sets,
                     const VkDescriptorSetLayoutCreateInfo *const *set_layouts,
                     uint32_t set_layout_count, void *mem_ctx,
                     const VkDescriptorSetLayoutCreateInfo *const **out_layouts, uint32_t *out_count,
@@ -224,35 +278,10 @@ s2i_resolve_layouts(nir_shader *nir, uint32_t max_sets,
    uint32_t highest_set = 0;
    bool any = false;
 
-   nir_foreach_variable_with_modes(var, nir, S2I_RESOURCE_MODES) {
-      const uint32_t aoa = glsl_get_aoa_size(var->type);
-
-      if (!s2i_note_descriptor(set_layouts, set_layout_count, max_sets, synthesize,
-                               var->data.descriptor_set, var->data.binding, aoa ? aoa : 1, nbind,
-                               &highest_set, &any, message))
+   for (uint32_t n = 0; n < nir_count; n++) {
+      if (!s2i_note_shader(nirs[n], set_layouts, set_layout_count, max_sets, synthesize, nbind,
+                           &highest_set, &any, message))
          return S2I_UNSUPPORTED_CAP;
-   }
-
-   /* The intrinsic carries no array size, so its count is 1 and a variable's richer count wins
-    * where both describe the same binding. */
-   nir_foreach_function_impl(impl, nir) {
-      nir_foreach_block(block, impl) {
-         nir_foreach_instr(instr, block) {
-
-            if (instr->type != nir_instr_type_intrinsic)
-               continue;
-
-            nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
-
-            if (intrin->intrinsic != nir_intrinsic_vulkan_resource_index)
-               continue;
-
-            if (!s2i_note_descriptor(set_layouts, set_layout_count, max_sets, synthesize,
-                                     nir_intrinsic_desc_set(intrin), nir_intrinsic_binding(intrin),
-                                     1, nbind, &highest_set, &any, message))
-               return S2I_UNSUPPORTED_CAP;
-         }
-      }
    }
 
    if (!synthesize || !any) {
@@ -294,7 +323,7 @@ s2i_resolve_layouts(nir_shader *nir, uint32_t max_sets,
       ptrs[set] = &infos[set];
    }
 
-   s2i_place_bindings(nir, infos);
+   s2i_place_bindings(nirs, nir_count, infos);
 
    *out_layouts = ptrs;
    *out_count = count;

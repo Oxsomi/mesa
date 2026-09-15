@@ -381,7 +381,7 @@ s2i_intel_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, 
    const VkDescriptorSetLayoutCreateInfo *const *eff_layouts = NULL;
    uint32_t eff_layout_count = 0;
 
-   result = s2i_resolve_layouts(nir, S2I_INTEL_ANV_MAX_SETS, pipeline->set_layouts,
+   result = s2i_resolve_layouts(&nir, 1, S2I_INTEL_ANV_MAX_SETS, pipeline->set_layouts,
                                 pipeline->set_layout_count, session.mem_ctx, &eff_layouts,
                                 &eff_layout_count, message);
 
