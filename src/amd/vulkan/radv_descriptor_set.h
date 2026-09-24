@@ -130,4 +130,18 @@ void radv_cmd_update_descriptor_sets(struct radv_device *device, struct radv_cmd
 void radv_descriptor_set_destroy(struct radv_device *device, struct radv_descriptor_pool *pool,
                                  struct radv_descriptor_set *set);
 
+struct radv_physical_device;
+
+void radv_descriptor_set_layout_count(const VkDescriptorSetLayoutCreateInfo *pCreateInfo, uint32_t *num_bindings_out,
+                                      uint32_t *immutable_sampler_count_out, uint32_t *ycbcr_sampler_count_out);
+
+void radv_descriptor_set_layout_init(const struct radv_physical_device *pdev,
+                                     const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
+                                     const VkDescriptorSetLayoutBinding *bindings,
+                                     const VkMutableDescriptorTypeCreateInfoEXT *mutable_info,
+                                     const VkDescriptorSetLayoutBindingFlagsCreateInfo *variable_flags,
+                                     struct radv_descriptor_set_layout *set_layout, uint32_t *samplers,
+                                     struct vk_ycbcr_conversion_state *ycbcr_samplers,
+                                     uint32_t *ycbcr_sampler_offsets, uint32_t num_bindings);
+
 #endif /* RADV_DESCRIPTOR_SET_H */

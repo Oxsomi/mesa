@@ -30,6 +30,10 @@ bool radv_mutable_descriptor_type_size_alignment(const struct radv_device *devic
                                                  const VkMutableDescriptorTypeListEXT *list, uint64_t *out_size,
                                                  uint64_t *out_align);
 
+bool radv_mutable_descriptor_type_size_alignment_pdev(const struct radv_physical_device *pdev,
+                                                      const VkMutableDescriptorTypeListEXT *list, uint64_t *out_size,
+                                                      uint64_t *out_align);
+
 static ALWAYS_INLINE void
 radv_write_texel_buffer_descriptor(unsigned *dst, const VkBufferView _buffer_view)
 {

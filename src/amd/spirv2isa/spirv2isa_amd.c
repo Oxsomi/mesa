@@ -54,7 +54,9 @@
 #include "radv_pipeline_compute.h"      /* radv_compile_cs */
 #include "radv_pipeline_graphics.h"     /* radv_graphics_shaders_compile, radv_graphics_state_key */
 #include "radv_pipeline_rt.h"           /* radv_ray_tracing_pipeline (synthesized offline) */
-#include "radv_descriptor_set.h"        /* radv_descriptor_set_layout (synthesized offline) */
+#include "radv_descriptor_set.h"        /* radv_descriptor_set_layout + the count/init carve */
+#include "radv_sampler.h"               /* the stand-in immutable sampler */
+#include "vk_descriptors.h"             /* vk_create_sorted_bindings, as the driver entry uses */
 #include "tools/radv_rra.h"             /* radv_rra_trace_data (the RT traversal derefs ci->rra_trace) */
 #include "nir/radv_nir.h"                       /* radv_nir_lower_call_abi */
 #include "nir/radv_nir_rt_stage_monolithic.h"   /* radv_nir_lower_rt_io/abi_monolithic */
@@ -211,136 +213,167 @@ s2i_class_of(s2i_stage stage)
    }
 }
 
-/* --- descriptor layout (built from the caller's bindings; RADV indexes binding[binding_number]) - */
+/* --- descriptor layout, placed by RADV's own code so offline agrees with a device --------- */
 
-/* Per-element descriptor size, mirroring RADV's own sizing. A switch rather than a table because
- * VkDescriptorType is sparse: its last members are extension values in the billions. */
-static uint32_t
-s2i_desc_size(VkDescriptorType type)
-{
-   switch (type) {
-   case VK_DESCRIPTOR_TYPE_SAMPLER:                return RADV_SAMPLER_DESC_SIZE;
-   case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: return RADV_STORAGE_IMAGE_DESC_SIZE +
-                                                          RADV_SAMPLER_DESC_SIZE;
-   case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:          return RADV_STORAGE_IMAGE_DESC_SIZE;
-   case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:          return RADV_STORAGE_IMAGE_DESC_SIZE;
-   case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:   return RADV_BUFFER_DESC_SIZE;
-   case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:   return RADV_BUFFER_DESC_SIZE;
-   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:         return RADV_BUFFER_DESC_SIZE;
-   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:         return RADV_BUFFER_DESC_SIZE;
-   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC: return RADV_BUFFER_DESC_SIZE;
-   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: return RADV_BUFFER_DESC_SIZE;
-   case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:       return RADV_STORAGE_IMAGE_DESC_SIZE;
-   case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:   return RADV_BUFFER_DESC_SIZE;
-   case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR: return RADV_ACCEL_STRUCT_DESC_SIZE;
-   default:                                        return 0;
-   }
-}
-
-/* RADV's set layout is a header with its bindings inline, so one sized allocation on the session's
- * context, which releases them all at the end of the compile. */
+/* One RADV set layout from one create info. The layout, its bindings and the immutable sampler
+ * block are a single allocation on the session context, the way vk_descriptor_set_layout_zalloc
+ * makes it one for the driver, and radv_descriptor_set_layout_init does the placement. Supplied
+ * immutable sampler handles may all be VK_NULL_HANDLE, which the public header allows, and the
+ * fill copies each sampler's state, so they point at one zeroed stand-in shared by every set. */
 static struct radv_descriptor_set_layout *
-s2i_alloc_set_layout(uint32_t binding_count, void *mem_ctx)
+s2i_build_one_layout(const struct radv_physical_device *pdev,
+                     const VkDescriptorSetLayoutCreateInfo *ci, void *mem_ctx,
+                     struct radv_sampler **stand_in)
 {
-   return (struct radv_descriptor_set_layout *) rzalloc_size(
-      mem_ctx, sizeof(struct radv_descriptor_set_layout) +
-               binding_count * sizeof(struct radv_descriptor_set_binding_layout));
-}
+   VkDescriptorSetLayoutCreateInfo local_ci;
+   bool any_immutable = false;
 
-/* Build one RADV descriptor set layout per set the caller referenced and attach them to `layout`.
- * Unused sets in [0, MAX_SETS) get a shared empty layout so any stray access stays in-bounds. The
- * offsets and sizes reach the ISA, not just reflection: they decide which descriptor a load
- * resolves to, so a layout that differs from the pipeline's produces different code. */
-static bool
-s2i_build_fed_layout(const VkDescriptorSetLayoutCreateInfo *const *set_layouts,
-                     uint32_t set_layout_count, struct radv_shader_layout *layout, void *mem_ctx)
-{
-   uint32_t nbind[MAX_SETS] = {0};
-
-   _Static_assert(MAX_SETS <= 32, "one bit per set below");
-   uint32_t used = 0;
-
-   for (uint32_t s = 0; s < set_layout_count && s < MAX_SETS; s++) {
-
-      if (!set_layouts[s])
-         continue;
-
-      used |= 1u << s;
-
-      for (uint32_t i = 0; i < set_layouts[s]->bindingCount; i++) {
-         const uint32_t b = set_layouts[s]->pBindings[i].binding;
-
-         if (b + 1 > nbind[s])
-            nbind[s] = b + 1;
-      }
+   for (uint32_t b = 0; b < ci->bindingCount; b++) {
+      if (ci->pBindings[b].pImmutableSamplers)
+         any_immutable = true;
    }
 
-   struct radv_descriptor_set_layout *empty = s2i_alloc_set_layout(0, mem_ctx);
+   if (any_immutable) {
+
+      if (!*stand_in)
+         *stand_in = rzalloc(mem_ctx, struct radv_sampler);
+
+      uint32_t max_count = 1;
+
+      for (uint32_t b = 0; b < ci->bindingCount; b++)
+         max_count = MAX2(max_count, ci->pBindings[b].descriptorCount);
+
+      VkDescriptorSetLayoutBinding *local_bindings =
+         rzalloc_array(mem_ctx, VkDescriptorSetLayoutBinding, ci->bindingCount);
+      VkSampler *stand_ins = rzalloc_array(mem_ctx, VkSampler, max_count);
+
+      if (!*stand_in || !local_bindings || !stand_ins)
+         return NULL;
+
+      for (uint32_t i = 0; i < max_count; i++)
+         stand_ins[i] = radv_sampler_to_handle(*stand_in);
+
+      for (uint32_t b = 0; b < ci->bindingCount; b++) {
+         local_bindings[b] = ci->pBindings[b];
+
+         if (local_bindings[b].pImmutableSamplers)
+            local_bindings[b].pImmutableSamplers = stand_ins;
+      }
+
+      local_ci = *ci;
+      local_ci.pBindings = local_bindings;
+      ci = &local_ci;
+   }
+
+   uint32_t num_bindings, immutable_sampler_count, ycbcr_sampler_count;
+   radv_descriptor_set_layout_count(ci, &num_bindings, &immutable_sampler_count,
+                                    &ycbcr_sampler_count);
+
+   /* The same sizing radv_CreateDescriptorSetLayout does, because the fill writes into these blocks
+    * by offset from the layout. */
+   const uint32_t samplers_offset =
+      offsetof(struct radv_descriptor_set_layout, binding[num_bindings]);
+   size_t size = samplers_offset + immutable_sampler_count * 4 * sizeof(uint32_t);
+
+   if (ycbcr_sampler_count > 0) {
+      size += num_bindings * sizeof(uint32_t);
+      size = align_uintptr(size, alignof(struct vk_ycbcr_conversion_state));
+      size += ycbcr_sampler_count * sizeof(struct vk_ycbcr_conversion_state);
+   }
+
+   struct radv_descriptor_set_layout *set_layout =
+      (struct radv_descriptor_set_layout *)rzalloc_size(mem_ctx, size);
+
+   if (!set_layout)
+      return NULL;
+
+   /* The Vulkan base is normally filled by the runtime while it allocates; flags is the only field
+    * the compile reads back. */
+   set_layout->vk.flags = ci->flags;
+   set_layout->vk.ref_cnt = 1;
+
+   uint32_t *samplers = (uint32_t *)&set_layout->binding[num_bindings];
+   struct vk_ycbcr_conversion_state *ycbcr_samplers = NULL;
+   uint32_t *ycbcr_sampler_offsets = NULL;
+
+   if (ycbcr_sampler_count > 0) {
+      ycbcr_sampler_offsets = samplers + 4 * immutable_sampler_count;
+      set_layout->ycbcr_sampler_offsets_offset = (char *)ycbcr_sampler_offsets - (char *)set_layout;
+
+      uintptr_t first = (uintptr_t)ycbcr_sampler_offsets + sizeof(uint32_t) * num_bindings;
+      first = align_uintptr(first, alignof(struct vk_ycbcr_conversion_state));
+      ycbcr_samplers = (struct vk_ycbcr_conversion_state *)first;
+   }
+
+   VkDescriptorSetLayoutBinding *sorted = NULL;
+
+   if (vk_create_sorted_bindings(ci->pBindings, ci->bindingCount, &sorted, NULL, NULL) !=
+       VK_SUCCESS)
+      return NULL;
+
+   const VkMutableDescriptorTypeCreateInfoEXT *mutable_info =
+      vk_find_struct_const(ci->pNext, MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_EXT);
+   const VkDescriptorSetLayoutBindingFlagsCreateInfo *variable_flags =
+      vk_find_struct_const(ci->pNext, DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO);
+
+   radv_descriptor_set_layout_init(pdev, ci, sorted, mutable_info, variable_flags, set_layout,
+                                   samplers, ycbcr_samplers, ycbcr_sampler_offsets, num_bindings);
+
+   free(sorted);
+   return set_layout;
+}
+
+/* Attach one layout per set to `layout`. Unused sets in [0, MAX_SETS) share an empty layout so a
+ * stray access stays in bounds, and the dynamic offset bases accumulate across sets the way a
+ * pipeline layout accumulates them, since offsets and sizes reach the ISA, not only reflection. */
+static bool
+s2i_build_fed_layout(const struct radv_physical_device *pdev,
+                     const VkDescriptorSetLayoutCreateInfo *const *set_layouts,
+                     uint32_t set_layout_count, struct radv_shader_layout *layout, void *mem_ctx,
+                     struct radv_sampler **stand_in)
+{
+   const VkDescriptorSetLayoutCreateInfo empty_ci = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+   };
+
+   struct radv_descriptor_set_layout *empty =
+      s2i_build_one_layout(pdev, &empty_ci, mem_ctx, stand_in);
+
    if (!empty)
       return false;
 
-   layout->num_sets = MAX_SETS;
-   for (uint32_t s = 0; s < MAX_SETS; s++) {
-      if (!(used & (1u << s))) {
-         layout->set[s].layout = empty;
-         continue;
-      }
+   uint32_t dynamic_offset_start = 0;
 
-      struct radv_descriptor_set_layout *dsl = s2i_alloc_set_layout(nbind[s], mem_ctx);
+   layout->num_sets = MAX_SETS;
+
+   for (uint32_t set = 0; set < MAX_SETS; set++) {
+
+      const VkDescriptorSetLayoutCreateInfo *ci =
+         set < set_layout_count && set_layouts[set] ? set_layouts[set] : NULL;
+
+      struct radv_descriptor_set_layout *dsl =
+         ci ? s2i_build_one_layout(pdev, ci, mem_ctx, stand_in) : empty;
+
       if (!dsl)
          return false;
-      dsl->binding_count = nbind[s];
 
-      uint32_t offset = 0;
-      for (uint32_t b = 0; b < nbind[s]; b++) {
-         const VkDescriptorSetLayoutBinding *fb = NULL;
-         for (uint32_t i = 0; i < set_layouts[s]->bindingCount; i++) {
-            if (set_layouts[s]->pBindings[i].binding == b) {
-               fb = &set_layouts[s]->pBindings[i];
-               break;
-            }
-         }
-
-         if (fb) {
-            uint32_t arr = fb->descriptorCount ? fb->descriptorCount : 1;
-            uint32_t sz = s2i_desc_size(fb->descriptorType);
-            dsl->binding[b].type = fb->descriptorType;
-            dsl->binding[b].array_size = arr;
-            dsl->binding[b].offset = offset;
-            dsl->binding[b].size = sz;
-            offset += sz * arr;
-         } else {
-            /* gap: a binding number the caller didn't use (the shader won't reference it) */
-            dsl->binding[b].type = VK_DESCRIPTOR_TYPE_SAMPLER;
-            dsl->binding[b].array_size = 0;
-            dsl->binding[b].offset = offset;
-            dsl->binding[b].size = 0;
-         }
-      }
-      dsl->size = offset;
-      layout->set[s].layout = dsl;
+      layout->set[set].layout = dsl;
+      layout->set[set].dynamic_offset_start = dynamic_offset_start;
+      dynamic_offset_start += dsl->dynamic_offset_count;
    }
+
+   layout->dynamic_offset_count = dynamic_offset_start;
    return true;
 }
-
 /* Every set an empty layout, which is what the discovery parse below compiles against. It cannot be
  * a zeroed radv_shader_layout: radv_shader_spirv_to_nir looks a Ycbcr conversion up through
  * layout->set[s].layout and dereferences it without a NULL check, so the sets have to exist before
  * the descriptors they will hold are known. */
 static bool
-s2i_build_empty_layout(struct radv_shader_layout *layout, void *mem_ctx)
+s2i_build_empty_layout(const struct radv_physical_device *pdev, struct radv_shader_layout *layout,
+                       void *mem_ctx, struct radv_sampler **stand_in)
 {
-   struct radv_descriptor_set_layout *empty = s2i_alloc_set_layout(0, mem_ctx);
-
-   if (!empty)
-      return false;
-
-   layout->num_sets = MAX_SETS;
-
-   for (uint32_t s = 0; s < MAX_SETS; s++)
-      layout->set[s].layout = empty;
-
-   return true;
+   return s2i_build_fed_layout(pdev, NULL, 0, layout, mem_ctx, stand_in);
 }
 
 /* Parse one module for layout discovery, and throw the result away: only the module says which
@@ -367,16 +400,18 @@ s2i_discovery_nir(struct radv_compiler_info *ci, const struct radv_shader_layout
  * against what the modules really reference, and otherwise synthesized from them through the shared
  * resolve every backend uses. */
 static s2i_result
-s2i_amd_resolve_layout(struct radv_compiler_info *ci, const s2i_rt_shader *shaders,
-                       size_t shader_count, const s2i_pipeline *pipeline,
-                       struct radv_shader_layout *layout, void *mem_ctx, char **message)
+s2i_amd_resolve_layout(struct radv_compiler_info *ci, const struct radv_physical_device *pdev,
+                       const s2i_rt_shader *shaders, size_t shader_count,
+                       const s2i_pipeline *pipeline, struct radv_shader_layout *layout,
+                       void *mem_ctx, char **message)
 {
+   struct radv_sampler *stand_in = NULL;
    struct radv_shader_layout empty;
    memset(&empty, 0, sizeof(empty));
 
    nir_shader **nirs = calloc(shader_count ? shader_count : 1, sizeof(*nirs));
 
-   if (!nirs || !s2i_build_empty_layout(&empty, mem_ctx)) {
+   if (!nirs || !s2i_build_empty_layout(pdev, &empty, mem_ctx, &stand_in)) {
 
       if (message)
          *message = strdup("descriptor layout allocation failed");
@@ -420,7 +455,7 @@ s2i_amd_resolve_layout(struct radv_compiler_info *ci, const s2i_rt_shader *shade
    if (result != S2I_OK)
       return result;
 
-   if (!s2i_build_fed_layout(eff_layouts, eff_layout_count, layout, mem_ctx)) {
+   if (!s2i_build_fed_layout(pdev, eff_layouts, eff_layout_count, layout, mem_ctx, &stand_in)) {
 
       if (message)
          *message = strdup("descriptor layout allocation failed");
@@ -433,16 +468,17 @@ s2i_amd_resolve_layout(struct radv_compiler_info *ci, const s2i_rt_shader *shade
 
 /* --- common device-free compiler setup ------------------------------------------------------ */
 
-/* The capability set a physical device would report, without having one. Allocated rather than put
- * on the stack because a radv_physical_device carries the whole property table, and freed straight
- * after: only the capability bitset outlives it. An allocation failure leaves the set empty, which
- * refuses every module by name rather than letting one through unchecked. */
-static void
-s2i_amd_fill_spirv_caps(const struct radeon_info *info, struct spirv_capabilities *caps,
-                        bool *rt_exposed)
+/* The physical device a driver would have, without one existing. It carries the whole property
+ * table, so it goes on the session context rather than the stack, and it OUTLIVES the capability
+ * gate: the descriptor sizing reads use_fmask and force_64_byte_sampled_image off it while placing
+ * the layout. NULL leaves the capability set empty, which refuses every module by name rather than
+ * letting one through unchecked. */
+static struct radv_physical_device *
+s2i_amd_make_physical_device(const struct radeon_info *info, struct spirv_capabilities *caps,
+                             bool *rt_exposed, void *mem_ctx)
 {
-   struct radv_physical_device *pdev = calloc(1, sizeof(*pdev));
-   struct radv_instance *instance = calloc(1, sizeof(*instance));
+   struct radv_physical_device *pdev = rzalloc(mem_ctx, struct radv_physical_device);
+   struct radv_instance *instance = rzalloc(mem_ctx, struct radv_instance);
 
    memset(caps, 0, sizeof(*caps));
    *rt_exposed = false;
@@ -467,8 +503,7 @@ s2i_amd_fill_spirv_caps(const struct radeon_info *info, struct spirv_capabilitie
       *rt_exposed = pdev->vk.supported_extensions.KHR_ray_tracing_pipeline;
    }
 
-   free(instance);
-   free(pdev);
+   return pdev && instance ? pdev : NULL;
 }
 
 /* Fills a device-free radv_compiler_info for `t`, plus the empty debug report and wave sizes that a
@@ -478,7 +513,7 @@ s2i_amd_fill_spirv_caps(const struct radeon_info *info, struct spirv_capabilitie
 static void
 s2i_setup_compiler_info(const struct s2i_target_desc *t, struct radeon_info *rad,
                         struct radv_compiler_info *ci, struct vk_debug_report *report,
-                        bool *rt_exposed)
+                        bool *rt_exposed, void *mem_ctx, struct radv_physical_device **pdev_out)
 {
    memset(rad, 0, sizeof(*rad));
    rad->gfx_level = t->gfx_level;
@@ -507,7 +542,7 @@ s2i_setup_compiler_info(const struct s2i_target_desc *t, struct radeon_info *rad
     * its supported tables from the device info and the instance, and the generated mapping turns
     * those into SPIR-V capabilities. A physical device is the only thing those tables hang off, so
     * one is built here and thrown away; nothing in it needs a winsys or an open device. */
-   s2i_amd_fill_spirv_caps(rad, &ci->spirv_caps, rt_exposed);
+   *pdev_out = s2i_amd_make_physical_device(rad, &ci->spirv_caps, rt_exposed, mem_ctx);
 
    /* vtn reports warnings/errors through ci.debug.debug_report; a physical device normally owns it.
     * With none, RADV passes NULL and the first vtn message dereferences it (crash). Give it a real,
@@ -603,18 +638,6 @@ s2i_nir_has_trace_ray(nir_shader *nir)
    return false;
 }
 
-/* Per-shader inlinability, matching radv_gather_ray_tracing_stage_info (static in RADV): raygen /
- * any-hit / intersection always inline, callable never, miss / closest-hit unless they traceRay. */
-static bool
-s2i_rt_can_inline(nir_shader *nir, mesa_shader_stage stage)
-{
-   if (stage == MESA_SHADER_RAYGEN || stage == MESA_SHADER_ANY_HIT || stage == MESA_SHADER_INTERSECTION)
-      return true;
-   if (stage == MESA_SHADER_CALLABLE)
-      return false;
-   return !s2i_nir_has_trace_ray(nir);
-}
-
 /* Ray tracing compile for one standalone shader, replicating radv_pipeline_rt.c's (static)
  * radv_rt_spirv_to_nir + radv_rt_nir_to_asm. A lone raygen that never traces is self-contained and
  * compiles MONOLITHICALLY (nothing to inline; a zeroed radv_ray_tracing_pipeline whose create_flags
@@ -654,7 +677,7 @@ s2i_compile_rt(struct radv_compiler_info *ci, const uint32_t *spirv, size_t spir
    const bool traces = s2i_nir_has_trace_ray(st.nir);
    const bool monolithic = (ms == MESA_SHADER_RAYGEN) && !traces;
    if (info) {
-      info->rt_can_inline = s2i_rt_can_inline(st.nir, ms) ? 1 : 0;
+      info->rt_can_inline = radv_gather_ray_tracing_stage_info(st.nir).can_inline ? 1 : 0;
       info->rt_mode = monolithic ? S2I_RT_MODE_MONOLITHIC : S2I_RT_MODE_FUNCTION_CALLS;
    }
 
@@ -834,7 +857,17 @@ s2i_amd_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2
    struct radv_compiler_info ci;
    struct vk_debug_report report;
    bool rt_exposed = false;
-   s2i_setup_compiler_info(t, &rad, &ci, &report, &rt_exposed);
+   struct radv_physical_device *pdev = NULL;
+   s2i_setup_compiler_info(t, &rad, &ci, &report, &rt_exposed, session.mem_ctx, &pdev);
+
+   if (!pdev) {
+
+      if (message)
+         *message = strdup("out of memory building the offline physical device");
+
+      result = S2I_COMPILE_FAILED;
+      goto done;
+   }
 
    /* A target RADV would not expose ray tracing on has no BVH unit to run it, so its RT ISA would
     * be for hardware that cannot execute it. */
@@ -885,7 +918,8 @@ s2i_amd_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2
          .stage = stage,
       };
 
-      result = s2i_amd_resolve_layout(&ci, &self, 1, pipeline, &layout, session.mem_ctx, message);
+      result =
+         s2i_amd_resolve_layout(&ci, pdev, &self, 1, pipeline, &layout, session.mem_ctx, message);
 
       if (result != S2I_OK)
          goto done;
@@ -925,12 +959,9 @@ s2i_amd_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2
       bin = s2i_compile_rt(&ci, spirv, spirv_words, entry, ms, &layout, &rs, info, &no_entry,
                            message);
    } else {
-      /* TODO: pipeline->graphics is not consumed here yet. RADV turns a create info into its own
-       * key with radv_generate_graphics_state_key, static in radv_pipeline_graphics.c, so it needs
-       * a carve export the way radv_physical_device_offline_supported did.
-       * Graphics: one unlinked stage, exactly like VK_EXT_shader_object compiles a single stage.
-       * The other stages stay MESA_SHADER_NONE; gfx_state carries the shader-object dynamic defaults
-       * so the (device-free) graphics compile has a valid key to reason about. */
+      /* Graphics: one stage of the pipeline the caller declared, or, with nothing declared, one
+       * unlinked stage exactly as VK_EXT_shader_object compiles one. The other stages stay
+       * MESA_SHADER_NONE either way. */
 
       /* NGG is a device property, not a per-stage one: a real device sets key.use_ngg from
        * pdev->use_ngg, which is on from GFX10 (Navi14 excepted) and unconditional from GFX11
@@ -960,16 +991,48 @@ s2i_amd_compile(const uint32_t *spirv, size_t spirv_words, const char *entry, s2
       stages[ms].layout = layout;
 
       struct radv_graphics_state_key gfx;
-      memset(&gfx, 0, sizeof(gfx));
-      gfx.vs.has_prolog = true;
-      gfx.ps.has_epilog = true;
-      gfx.dynamic_rasterization_samples = true;
-      gfx.dynamic_provoking_vtx_mode = true;
-      gfx.smooth_lines_may_be_enabled = true;
-      gfx.rs.polygon_mode_unknown = true;
-      gfx.ps.exports_mrtz_via_epilog = true;
-      for (uint32_t i = 0; i < MAX_RTS; i++)
-         gfx.ps.epilog.color_map[i] = i;
+
+      if (pipeline->graphics) {
+
+         /* vk_graphics_pipeline_state_fill reads the device once, for
+          * enabled_features.advancedBlendCoherentOperations, which decides whether blend equations
+          * count as dynamic. The key below never tests that bit, so a zeroed device says what an
+          * offline compile means: no advanced blend coherency was declared. */
+         struct vk_device stub_dev;
+         memset(&stub_dev, 0, sizeof(stub_dev));
+         stub_dev.base.type = VK_OBJECT_TYPE_DEVICE;
+         stub_dev.base.device = &stub_dev;
+         stub_dev.alloc = *vk_default_allocator();
+
+         struct vk_graphics_pipeline_all_state gfx_all;
+         struct vk_graphics_pipeline_state gfx_state;
+
+         if (!s2i_graphics_state(&stub_dev, pipeline->graphics, &gfx_all, &gfx_state, message)) {
+            result = S2I_UNSUPPORTED_CAP;
+            goto done;
+         }
+
+         /* custom_blend_mode is a RADV-private pNext a caller cannot reach through this API. */
+         gfx = radv_generate_graphics_state_key(&ci, &gfx_state, ALL_GRAPHICS_LIB_FLAGS, 0);
+
+         if (info)
+            info->graphics_specialized = 1;
+
+      } else {
+
+         /* The shader-object defaults: each stage alone, with a vertex prolog and a colour
+          * epilog, and the state a pipeline would pin left dynamic. */
+         memset(&gfx, 0, sizeof(gfx));
+         gfx.vs.has_prolog = true;
+         gfx.ps.has_epilog = true;
+         gfx.dynamic_rasterization_samples = true;
+         gfx.dynamic_provoking_vtx_mode = true;
+         gfx.smooth_lines_may_be_enabled = true;
+         gfx.rs.polygon_mode_unknown = true;
+         gfx.ps.exports_mrtz_via_epilog = true;
+         for (uint32_t i = 0; i < MAX_RTS; i++)
+            gfx.ps.epilog.color_map[i] = i;
+      }
 
       struct radv_shader_binary *binaries[MESA_VULKAN_SHADER_STAGES] = {NULL};
       struct radv_shader_debug_info debug[MESA_VULKAN_SHADER_STAGES] = {0};
@@ -1124,6 +1187,24 @@ s2i_amd_compile_rt_pipeline(const s2i_rt_shader *shaders, size_t shader_count, s
       }
    }
 
+   /* A synthesized group has no any-hit or intersection member, so RADV would never inline those
+    * into the traversal and their terminateRay would reach ACO, which has no selection for it and
+    * calls abort(). Refuse by name while this is still the caller's error to fix. */
+   if (!pipeline->ray_tracing) {
+      for (size_t i = 0; i < shader_count; i++) {
+
+         if (shaders[i].stage != S2I_STAGE_ANY_HIT && shaders[i].stage != S2I_STAGE_INTERSECTION)
+            continue;
+
+         if (message)
+            *message = strdup("an any-hit or intersection shader has to arrive in a declared hit "
+                              "group: set s2i_pipeline.ray_tracing, because a synthesized group "
+                              "cannot carry one");
+
+         return S2I_UNSUPPORTED_CAP;
+      }
+   }
+
    struct s2i_session session;
 
    if (!s2i_session_open(&session))
@@ -1134,7 +1215,8 @@ s2i_amd_compile_rt_pipeline(const s2i_rt_shader *shaders, size_t shader_count, s
    struct radv_compiler_info ci;
    struct vk_debug_report report;
    bool rt_exposed = false;
-   s2i_setup_compiler_info(t, &rad, &ci, &report, &rt_exposed);
+   struct radv_physical_device *pdev = NULL;
+   s2i_setup_compiler_info(t, &rad, &ci, &report, &rt_exposed, session.mem_ctx, &pdev);
 
    if (!rt_exposed) {
 
@@ -1158,8 +1240,13 @@ s2i_amd_compile_rt_pipeline(const s2i_rt_shader *shaders, size_t shader_count, s
    memset(&stub_dev, 0, sizeof(stub_dev));
    stub_dev.alloc = *vk_default_allocator();
 
+   /* A declared pipeline says how many groups it has, and that is not the shader count: a hit group
+    * carries its closest-hit and any-hit shaders as one group. */
+   const VkRayTracingPipelineCreateInfoKHR *rt_ci = pipeline->ray_tracing;
+   const uint32_t group_count = rt_ci ? rt_ci->groupCount : (uint32_t)shader_count;
+
    struct radv_ray_tracing_stage *rt_stages = calloc(shader_count, sizeof(*rt_stages));
-   struct radv_ray_tracing_group *groups = calloc(shader_count, sizeof(*groups));
+   struct radv_ray_tracing_group *groups = calloc(group_count ? group_count : 1, sizeof(*groups));
    struct radv_shader_stage entry_st;
    memset(&entry_st, 0, sizeof(entry_st));
    nir_shader *entry_nir = NULL;
@@ -1175,16 +1262,43 @@ s2i_amd_compile_rt_pipeline(const s2i_rt_shader *shaders, size_t shader_count, s
       goto cleanup;
    }
 
+   if (rt_ci) {
+
+      for (uint32_t g = 0; g < rt_ci->groupCount; g++) {
+
+         const VkRayTracingShaderGroupCreateInfoKHR *gi = &rt_ci->pGroups[g];
+         const uint32_t idx[4] = { gi->generalShader, gi->closestHitShader, gi->anyHitShader,
+                                   gi->intersectionShader };
+
+         for (uint32_t k = 0; k < 4; k++) {
+
+            if (idx[k] == VK_SHADER_UNUSED_KHR || idx[k] < shader_count)
+               continue;
+
+            if (message) {
+               char buf[160];
+               snprintf(buf, sizeof(buf),
+                        "ray tracing group %u names shader %u, and %zu shaders were passed", g,
+                        idx[k], shader_count);
+               *message = strdup(buf);
+            }
+
+            result = S2I_BAD_SPIRV;
+            goto cleanup;
+         }
+      }
+   }
+
    /* One layout for the whole pipeline, resolved from every shader in it. */
-   result = s2i_amd_resolve_layout(&ci, shaders, shader_count, pipeline, &layout, session.mem_ctx,
-                                   message);
+   result = s2i_amd_resolve_layout(&ci, pdev, shaders, shader_count, pipeline, &layout,
+                                   session.mem_ctx, message);
 
    if (result != S2I_OK)
       goto cleanup;
 
-   /* Front half for every shader: NIR + payload/attrib sizing; serialize callees into stage handles;
-    * build the groups. Each shader becomes one group (general for raygen/miss/callable, a hit group
-    * for hit shaders); distinct synthetic handle pointers let the monolithic inliner switch on them. */
+   /* Front half for every shader: NIR + payload/attrib sizing, then serialize it into a stage
+    * handle. The per-stage info is RADV's own gather over the NIR, which is where the ray flags a
+    * shader always sets or never sets come from; it cannot be guessed from the stage. */
    for (size_t i = 0; i < shader_count; i++) {
       const mesa_shader_stage ms = s2i_stage_to_mesa(shaders[i].stage);
       nir_shader *nir = s2i_rt_shader_to_nir(&ci, &layout, ms, shaders[i].spirv,
@@ -1198,19 +1312,8 @@ s2i_amd_compile_rt_pipeline(const s2i_rt_shader *shaders, size_t shader_count, s
       }
 
       rt_stages[i].stage = ms;
-      rt_stages[i].info.can_inline = s2i_rt_can_inline(nir, ms);
-      rt_stages[i].info.set_flags = 0xFFFFFFFF;
-      rt_stages[i].info.unset_flags = 0xFFFFFFFF;
+      rt_stages[i].info = radv_gather_ray_tracing_stage_info(nir);
       rt_stages[i].nir = s2i_nir_to_handle(&stub_dev, nir, (uint32_t)i);
-
-      const bool general = ms == MESA_SHADER_RAYGEN || ms == MESA_SHADER_MISS || ms == MESA_SHADER_CALLABLE;
-      groups[i].type = general ? VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR
-                               : VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
-      groups[i].recursive_shader = (uint32_t)i;
-      groups[i].any_hit_shader = VK_SHADER_UNUSED_KHR;
-      groups[i].intersection_shader = VK_SHADER_UNUSED_KHR;
-      groups[i].handle.recursive_shader_ptr = 0x1000ull + i * 0x100ull;
-      groups[i].handle.general_index = (uint32_t)i; /* union: also closest_hit_index */
 
       if (!compile_traversal && i == entry_index) {
          entry_nir = nir;
@@ -1226,12 +1329,57 @@ s2i_amd_compile_rt_pipeline(const s2i_rt_shader *shaders, size_t shader_count, s
       }
    }
 
+   if (rt_ci) {
+      radv_rt_fill_groups(rt_ci, groups);
+   } else {
+
+      /* No pipeline declared: one general or hit group per shader, with no any-hit or intersection
+       * member. A real hit group cannot be expressed this way, which is why a shader that would
+       * need one is refused before any of this runs. */
+      for (size_t i = 0; i < shader_count; i++) {
+
+         const mesa_shader_stage ms = s2i_stage_to_mesa(shaders[i].stage);
+         const bool general =
+            ms == MESA_SHADER_RAYGEN || ms == MESA_SHADER_MISS || ms == MESA_SHADER_CALLABLE;
+
+         groups[i].type = general ? VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR
+                                  : VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+         groups[i].recursive_shader = (uint32_t)i;
+         groups[i].any_hit_shader = VK_SHADER_UNUSED_KHR;
+         groups[i].intersection_shader = VK_SHADER_UNUSED_KHR;
+      }
+   }
+
+   /* The handles a device fills with real shader addresses. Offline they only have to be distinct,
+    * because that is all the monolithic inliner switches on, but they have to land in the right
+    * union member: general_index and closest_hit_index share storage, as do intersection_index and
+    * any_hit_index. */
+   for (uint32_t g = 0; g < group_count; g++) {
+
+      if (groups[g].recursive_shader != VK_SHADER_UNUSED_KHR)
+         groups[g].handle.recursive_shader_ptr = 0x1000ull + g * 0x100ull;
+
+      if (groups[g].type == VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR)
+         groups[g].handle.general_index = g;
+      else
+         groups[g].handle.closest_hit_index = g;
+
+      if (groups[g].intersection_shader != VK_SHADER_UNUSED_KHR)
+         groups[g].handle.intersection_index = g;
+      else if (groups[g].any_hit_shader != VK_SHADER_UNUSED_KHR)
+         groups[g].handle.any_hit_index = g;
+
+      if (groups[g].any_hit_shader != VK_SHADER_UNUSED_KHR ||
+          groups[g].intersection_shader != VK_SHADER_UNUSED_KHR)
+         groups[g].handle.ahit_isec_ptr = 0x8000ull + g * 0x100ull;
+   }
+
    struct radv_ray_tracing_pipeline rt_pipeline;
    memset(&rt_pipeline, 0, sizeof(rt_pipeline));
    rt_pipeline.stages = rt_stages;
    rt_pipeline.stage_count = (unsigned)shader_count;
    rt_pipeline.groups = groups;
-   rt_pipeline.group_count = (unsigned)shader_count;
+   rt_pipeline.group_count = group_count;
 
    struct radv_shader_debug_info dbg;
    memset(&dbg, 0, sizeof(dbg));
@@ -1381,12 +1529,14 @@ s2i_amd_unsupported_caps(const uint32_t *caps_used, size_t caps_count, int targe
       const char *name = NULL;
       for (size_t g = 0; g < ARRAY_SIZE(s2i_cap_gates); g++) {
          if (caps_used[i] == s2i_cap_gates[g].cap) {
-      /* GFX1013 is GFX10 with ray tracing hardware, predating the GFX10_3 floor the RT rows use. */
-      if (family == CHIP_GFX1013 &&
-          (s2i_cap_gates[i].cap == SpvCapabilityRayQueryKHR ||
-           s2i_cap_gates[i].cap == SpvCapabilityRayTracingKHR ||
-           s2i_cap_gates[i].cap == SpvCapabilityRayTraversalPrimitiveCullingKHR))
-         continue;
+
+            /* GFX1013 is GFX10 with ray tracing hardware, predating the GFX10_3 floor the RT rows
+             * use, so it is not missing what its row says it is. */
+            if (family == CHIP_GFX1013 &&
+                (s2i_cap_gates[g].cap == SpvCapabilityRayQueryKHR ||
+                 s2i_cap_gates[g].cap == SpvCapabilityRayTracingKHR ||
+                 s2i_cap_gates[g].cap == SpvCapabilityRayTraversalPrimitiveCullingKHR))
+               break;
 
             if (gfx < s2i_cap_gates[g].min)
                name = s2i_cap_gates[g].name;

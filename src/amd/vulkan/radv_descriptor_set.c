@@ -13,23 +13,17 @@
 #include "radv_sampler.h"
 #include "vk_descriptors.h"
 
-VKAPI_ATTR VkResult VKAPI_CALL
-radv_CreateDescriptorSetLayout(VkDevice _device, const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
-                               const VkAllocationCallbacks *pAllocator, VkDescriptorSetLayout *pSetLayout)
+/* Sizes a layout allocation: the highest binding number used, how many immutable samplers the
+ * bindings carry, and how many of those carry a ycbcr conversion. A caller with no device needs all
+ * three before it can allocate anything. */
+void
+radv_descriptor_set_layout_count(const VkDescriptorSetLayoutCreateInfo *pCreateInfo, uint32_t *num_bindings_out,
+                                 uint32_t *immutable_sampler_count_out, uint32_t *ycbcr_sampler_count_out)
 {
-   VK_FROM_HANDLE(radv_device, device, _device);
-   const struct radv_physical_device *pdev = radv_device_physical(device);
-   struct radv_descriptor_set_layout *set_layout;
-
-   assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO);
-   const VkDescriptorSetLayoutBindingFlagsCreateInfo *variable_flags =
-      vk_find_struct_const(pCreateInfo->pNext, DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO);
-   const VkMutableDescriptorTypeCreateInfoEXT *mutable_info =
-      vk_find_struct_const(pCreateInfo->pNext, MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_EXT);
-
    uint32_t num_bindings = 0;
    uint32_t immutable_sampler_count = 0;
    uint32_t ycbcr_sampler_count = 0;
+
    for (uint32_t j = 0; j < pCreateInfo->bindingCount; j++) {
       num_bindings = MAX2(num_bindings, pCreateInfo->pBindings[j].binding + 1);
       if ((pCreateInfo->pBindings[j].descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
@@ -48,47 +42,27 @@ radv_CreateDescriptorSetLayout(VkDevice _device, const VkDescriptorSetLayoutCrea
       }
    }
 
+   *num_bindings_out = num_bindings;
+   *immutable_sampler_count_out = immutable_sampler_count;
+   *ycbcr_sampler_count_out = ycbcr_sampler_count;
+}
+
+/* Fill an already-allocated set layout: sizes, offsets, dynamic offsets and the immutable sampler
+ * payload, which is everything a compile reads off a layout. Split out of radv_CreateDescriptorSetLayout
+ * so a caller with no device (spirv2isa) places descriptors exactly as the driver does; the allocation,
+ * the sorted-binding scratch and the hash stay with the driver. `bindings` must be the sorted array, and
+ * the layout, sampler and ycbcr blocks must be sized the way the entry point sizes them. */
+void
+radv_descriptor_set_layout_init(const struct radv_physical_device *pdev,
+                                const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
+                                const VkDescriptorSetLayoutBinding *bindings,
+                                const VkMutableDescriptorTypeCreateInfoEXT *mutable_info,
+                                const VkDescriptorSetLayoutBindingFlagsCreateInfo *variable_flags,
+                                struct radv_descriptor_set_layout *set_layout, uint32_t *samplers,
+                                struct vk_ycbcr_conversion_state *ycbcr_samplers, uint32_t *ycbcr_sampler_offsets,
+                                uint32_t num_bindings)
+{
    uint32_t samplers_offset = offsetof(struct radv_descriptor_set_layout, binding[num_bindings]);
-   size_t size = samplers_offset + immutable_sampler_count * 4 * sizeof(uint32_t);
-   if (ycbcr_sampler_count > 0) {
-      /* Store block of offsets first, followed by the conversion descriptors (padded to the struct
-       * alignment) */
-      size += num_bindings * sizeof(uint32_t);
-      size = align_uintptr(size, alignof(struct vk_ycbcr_conversion_state));
-      size += ycbcr_sampler_count * sizeof(struct vk_ycbcr_conversion_state);
-   }
-
-   /* We need to allocate descriptor set layouts off the device allocator with DEVICE scope because
-    * they are reference counted and may not be destroyed when vkDestroyDescriptorSetLayout is
-    * called.
-    */
-   set_layout = vk_descriptor_set_layout_zalloc(&device->vk, size, pCreateInfo);
-   if (!set_layout)
-      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
-
-   set_layout->flags = pCreateInfo->flags;
-
-   /* We just allocate all the samplers at the end of the struct */
-   uint32_t *samplers = (uint32_t *)&set_layout->binding[num_bindings];
-   struct vk_ycbcr_conversion_state *ycbcr_samplers = NULL;
-   uint32_t *ycbcr_sampler_offsets = NULL;
-
-   if (ycbcr_sampler_count > 0) {
-      ycbcr_sampler_offsets = samplers + 4 * immutable_sampler_count;
-      set_layout->ycbcr_sampler_offsets_offset = (char *)ycbcr_sampler_offsets - (char *)set_layout;
-
-      uintptr_t first_ycbcr_sampler_offset = (uintptr_t)ycbcr_sampler_offsets + sizeof(uint32_t) * num_bindings;
-      first_ycbcr_sampler_offset = align_uintptr(first_ycbcr_sampler_offset, alignof(struct vk_ycbcr_conversion_state));
-      ycbcr_samplers = (struct vk_ycbcr_conversion_state *)first_ycbcr_sampler_offset;
-   } else
-      set_layout->ycbcr_sampler_offsets_offset = 0;
-
-   VkDescriptorSetLayoutBinding *bindings = NULL;
-   VkResult result = vk_create_sorted_bindings(pCreateInfo->pBindings, pCreateInfo->bindingCount, &bindings, NULL, NULL);
-   if (result != VK_SUCCESS) {
-      vk_descriptor_set_layout_unref(&device->vk, &set_layout->vk);
-      return vk_error(device, result);
-   }
 
    set_layout->binding_count = num_bindings;
    set_layout->dynamic_shader_stages = 0;
@@ -102,8 +76,8 @@ radv_CreateDescriptorSetLayout(VkDevice _device, const VkDescriptorSetLayoutCrea
       uint32_t last_alignment = radv_descriptor_alignment(bindings[pCreateInfo->bindingCount - 1].descriptorType);
       if (bindings[pCreateInfo->bindingCount - 1].descriptorType == VK_DESCRIPTOR_TYPE_MUTABLE_EXT) {
          uint64_t mutable_size = 0, mutable_align = 0;
-         radv_mutable_descriptor_type_size_alignment(
-            device, &mutable_info->pMutableDescriptorTypeLists[pCreateInfo->bindingCount - 1], &mutable_size,
+         radv_mutable_descriptor_type_size_alignment_pdev(
+            pdev, &mutable_info->pMutableDescriptorTypeLists[pCreateInfo->bindingCount - 1], &mutable_size,
             &mutable_align);
          last_alignment = mutable_align;
       }
@@ -165,7 +139,7 @@ radv_CreateDescriptorSetLayout(VkDevice _device, const VkDescriptorSetLayoutCrea
             break;
          case VK_DESCRIPTOR_TYPE_MUTABLE_EXT: {
             uint64_t mutable_size = 0, mutable_align = 0;
-            radv_mutable_descriptor_type_size_alignment(device, &mutable_info->pMutableDescriptorTypeLists[j],
+            radv_mutable_descriptor_type_size_alignment_pdev(pdev, &mutable_info->pMutableDescriptorTypeLists[j],
                                                         &mutable_size, &mutable_align);
             assert(mutable_size && mutable_align);
             set_layout->binding[b].size = mutable_size;
@@ -232,9 +206,73 @@ radv_CreateDescriptorSetLayout(VkDevice _device, const VkDescriptorSetLayoutCrea
       }
    }
 
+   set_layout->dynamic_offset_count = dynamic_offset_count;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+radv_CreateDescriptorSetLayout(VkDevice _device, const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
+                               const VkAllocationCallbacks *pAllocator, VkDescriptorSetLayout *pSetLayout)
+{
+   VK_FROM_HANDLE(radv_device, device, _device);
+   const struct radv_physical_device *pdev = radv_device_physical(device);
+   struct radv_descriptor_set_layout *set_layout;
+
+   assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO);
+   const VkDescriptorSetLayoutBindingFlagsCreateInfo *variable_flags =
+      vk_find_struct_const(pCreateInfo->pNext, DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO);
+   const VkMutableDescriptorTypeCreateInfoEXT *mutable_info =
+      vk_find_struct_const(pCreateInfo->pNext, MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_EXT);
+
+   uint32_t num_bindings, immutable_sampler_count, ycbcr_sampler_count;
+   radv_descriptor_set_layout_count(pCreateInfo, &num_bindings, &immutable_sampler_count, &ycbcr_sampler_count);
+
+   uint32_t samplers_offset = offsetof(struct radv_descriptor_set_layout, binding[num_bindings]);
+   size_t size = samplers_offset + immutable_sampler_count * 4 * sizeof(uint32_t);
+   if (ycbcr_sampler_count > 0) {
+      /* Store block of offsets first, followed by the conversion descriptors (padded to the struct
+       * alignment) */
+      size += num_bindings * sizeof(uint32_t);
+      size = align_uintptr(size, alignof(struct vk_ycbcr_conversion_state));
+      size += ycbcr_sampler_count * sizeof(struct vk_ycbcr_conversion_state);
+   }
+
+   /* We need to allocate descriptor set layouts off the device allocator with DEVICE scope because
+    * they are reference counted and may not be destroyed when vkDestroyDescriptorSetLayout is
+    * called.
+    */
+   set_layout = vk_descriptor_set_layout_zalloc(&device->vk, size, pCreateInfo);
+   if (!set_layout)
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   set_layout->flags = pCreateInfo->flags;
+
+   /* We just allocate all the samplers at the end of the struct */
+   uint32_t *samplers = (uint32_t *)&set_layout->binding[num_bindings];
+   struct vk_ycbcr_conversion_state *ycbcr_samplers = NULL;
+   uint32_t *ycbcr_sampler_offsets = NULL;
+
+   if (ycbcr_sampler_count > 0) {
+      ycbcr_sampler_offsets = samplers + 4 * immutable_sampler_count;
+      set_layout->ycbcr_sampler_offsets_offset = (char *)ycbcr_sampler_offsets - (char *)set_layout;
+
+      uintptr_t first_ycbcr_sampler_offset = (uintptr_t)ycbcr_sampler_offsets + sizeof(uint32_t) * num_bindings;
+      first_ycbcr_sampler_offset = align_uintptr(first_ycbcr_sampler_offset, alignof(struct vk_ycbcr_conversion_state));
+      ycbcr_samplers = (struct vk_ycbcr_conversion_state *)first_ycbcr_sampler_offset;
+   } else
+      set_layout->ycbcr_sampler_offsets_offset = 0;
+
+   VkDescriptorSetLayoutBinding *bindings = NULL;
+   VkResult result = vk_create_sorted_bindings(pCreateInfo->pBindings, pCreateInfo->bindingCount, &bindings, NULL, NULL);
+   if (result != VK_SUCCESS) {
+      vk_descriptor_set_layout_unref(&device->vk, &set_layout->vk);
+      return vk_error(device, result);
+   }
+
+   radv_descriptor_set_layout_init(pdev, pCreateInfo, bindings, mutable_info, variable_flags, set_layout,
+                                   samplers, ycbcr_samplers, ycbcr_sampler_offsets, num_bindings);
+
    free(bindings);
 
-   set_layout->dynamic_offset_count = dynamic_offset_count;
 
    /* Hash the entire set layout except vk_descriptor_set_layout. The rest of the set layout is
     * carefully constructed to not have pointers so a full hash instead of a per-field hash

@@ -2524,6 +2524,15 @@ radv_is_gpu_supported(const struct radeon_info *info)
 void
 radv_physical_device_offline_supported(struct radv_physical_device *pdev)
 {
+   /* Descriptor sizing reads these two, and radv_physical_device_try_create sets them on the path
+    * that opens a real device. Derive them here from the same inputs, so an offline layout is sized
+    * the way the driver would size it: the instance is the caller's, with driconf defaults applied,
+    * so its debug flags are whatever it asked for. */
+   const struct radv_instance *instance = radv_physical_device_instance(pdev);
+
+   pdev->use_fmask = pdev->info.compiler_info.has_fmask && !(instance->debug_flags & RADV_DEBUG_NO_FMASK);
+   pdev->force_64_byte_sampled_image = !pdev->use_fmask && instance->drirc.debug.force_64_byte_sampled_image;
+
    radv_physical_device_get_supported_extensions(pdev, &pdev->vk.supported_extensions);
    radv_physical_device_get_features(pdev, &pdev->vk.supported_features);
    radv_get_physical_device_properties(pdev);

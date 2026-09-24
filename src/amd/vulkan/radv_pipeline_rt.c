@@ -221,14 +221,14 @@ radv_rt_init_capture_replay(struct radv_device *device, const VkRayTracingPipeli
    return result;
 }
 
-static VkResult
-radv_rt_fill_group_info(struct radv_device *device, const VkRayTracingPipelineCreateInfoKHR *pCreateInfo,
-                        const struct radv_ray_tracing_stage *stages, struct radv_ray_tracing_group *groups)
+/* Which shader each group recurses into, and its any-hit and intersection members, straight off the
+ * create info. Split out of radv_rt_fill_group_info because it is a pure function of the create info:
+ * a caller with no device (spirv2isa) needs exactly this half and cannot have the handles, which are
+ * real shader addresses. */
+void
+radv_rt_fill_groups(const VkRayTracingPipelineCreateInfoKHR *pCreateInfo, struct radv_ray_tracing_group *groups)
 {
-   VkResult result = radv_create_group_handles(device, pCreateInfo, stages, groups);
-
-   uint32_t idx;
-   for (idx = 0; idx < pCreateInfo->groupCount; idx++) {
+   for (uint32_t idx = 0; idx < pCreateInfo->groupCount; idx++) {
       groups[idx].type = pCreateInfo->pGroups[idx].type;
       if (groups[idx].type == VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR)
          groups[idx].recursive_shader = pCreateInfo->pGroups[idx].generalShader;
@@ -237,6 +237,16 @@ radv_rt_fill_group_info(struct radv_device *device, const VkRayTracingPipelineCr
       groups[idx].any_hit_shader = pCreateInfo->pGroups[idx].anyHitShader;
       groups[idx].intersection_shader = pCreateInfo->pGroups[idx].intersectionShader;
    }
+}
+
+static VkResult
+radv_rt_fill_group_info(struct radv_device *device, const VkRayTracingPipelineCreateInfoKHR *pCreateInfo,
+                        const struct radv_ray_tracing_stage *stages, struct radv_ray_tracing_group *groups)
+{
+   VkResult result = radv_create_group_handles(device, pCreateInfo, stages, groups);
+
+   uint32_t idx = pCreateInfo->groupCount;
+   radv_rt_fill_groups(pCreateInfo, groups);
 
    /* copy and adjust library groups (incl. handles) */
    if (pCreateInfo->pLibraryInfo) {
@@ -594,7 +604,7 @@ radv_rt_const_arg_info_combine(struct radv_rt_const_arg_info *dst, const struct 
    }
 }
 
-static struct radv_ray_tracing_stage_info
+struct radv_ray_tracing_stage_info
 radv_gather_ray_tracing_stage_info(nir_shader *nir)
 {
    struct radv_ray_tracing_stage_info info = {

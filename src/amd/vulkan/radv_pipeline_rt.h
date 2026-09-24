@@ -124,6 +124,13 @@ VkResult radv_generate_ray_tracing_state_key(struct radv_device *device,
 
 void radv_ray_tracing_state_key_finish(struct radv_ray_tracing_state_key *rt_state);
 
+/* Device-free halves, so an offline compile can build the same pipeline description a driver does. */
+
+void radv_rt_fill_groups(const VkRayTracingPipelineCreateInfoKHR *pCreateInfo,
+                         struct radv_ray_tracing_group *groups);
+
+struct radv_ray_tracing_stage_info radv_gather_ray_tracing_stage_info(nir_shader *nir);
+
 struct radv_ray_tracing_binary_header {
    uint32_t is_traversal_shader : 1;
    uint32_t has_shader : 1;

@@ -614,6 +614,19 @@ struct radv_ia_multi_vgt_param_helpers radv_compute_ia_multi_vgt_param(const str
 
 void radv_get_viewport_xform(const VkViewport *viewport, float scale[3], float translate[3]);
 
+#define ALL_GRAPHICS_LIB_FLAGS                                                                                         \
+   (VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT |                                                      \
+    VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT |                                                   \
+    VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT |                                                             \
+    VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT)
+
+/* Device-free: everything it reads comes from the compiler info and the state. An offline compile
+ * builds the same key a pipeline create would. */
+struct radv_graphics_state_key radv_generate_graphics_state_key(const struct radv_compiler_info *compiler_info,
+                                                                const struct vk_graphics_pipeline_state *state,
+                                                                VkGraphicsPipelineLibraryFlagBitsEXT lib_flags,
+                                                                uint32_t custom_blend_mode);
+
 void radv_translate_blend_equation(const struct radv_physical_device *pdev, VkBlendOp eqRGB, VkBlendFactor srcRGB,
                                    VkBlendFactor dstRGB, VkBlendOp eqA, VkBlendFactor srcA, VkBlendFactor dstA,
                                    uint32_t *cb_blend_control_out, uint32_t *sx_mrt_blend_opt_out);

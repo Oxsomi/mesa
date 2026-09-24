@@ -234,6 +234,22 @@ print_stats(FILE *out, const char *prefix, const s2i_stats *stats)
    }
 }
 
+/* The Vulkan stage bit for a ray tracing stage, so the CLI can declare a create info the way a
+ * driver receives one. */
+static VkShaderStageFlagBits
+s2i_stage_to_vk(s2i_stage stage)
+{
+   switch (stage) {
+   case S2I_STAGE_RAYGEN:       return VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+   case S2I_STAGE_MISS:         return VK_SHADER_STAGE_MISS_BIT_KHR;
+   case S2I_STAGE_CLOSEST_HIT:  return VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+   case S2I_STAGE_ANY_HIT:      return VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
+   case S2I_STAGE_INTERSECTION: return VK_SHADER_STAGE_INTERSECTION_BIT_KHR;
+   case S2I_STAGE_CALLABLE:     return VK_SHADER_STAGE_CALLABLE_BIT_KHR;
+   default:                     return VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+   }
+}
+
 static int
 run_rt_pipeline(int argc, char **argv, s2i_target target, int compile_traversal)
 {
@@ -242,15 +258,67 @@ run_rt_pipeline(int argc, char **argv, s2i_target target, int compile_traversal)
    const size_t capacity = (size_t)(argc > 3 ? argc - 3 : 0);
    s2i_rt_shader *shaders = (s2i_rt_shader *)calloc(capacity ? capacity : 1, sizeof(*shaders));
    uint32_t **bufs = (uint32_t **)calloc(capacity ? capacity : 1, sizeof(*bufs));
-   size_t n = 0;
+   VkRayTracingShaderGroupCreateInfoKHR *groups =
+      (VkRayTracingShaderGroupCreateInfoKHR *)calloc(capacity ? capacity : 1, sizeof(*groups));
+   VkPipelineShaderStageCreateInfo *stage_infos =
+      (VkPipelineShaderStageCreateInfo *)calloc(capacity ? capacity : 1, sizeof(*stage_infos));
+   size_t n = 0, ng = 0;
    int status = 1;
 
-   if (!shaders || !bufs) {
+   if (!shaders || !bufs || !groups || !stage_infos) {
       fprintf(stderr, "out of memory\n");
       goto cleanup;
    }
 
    for (int i = 3; i < argc; i++) {
+
+      /* A group declaration rather than a shader: it names shaders by their position in this
+       * command line, which is the order they reach the library in. */
+      if (!strncmp(argv[i], "group:", 6)) {
+
+         const char *spec = argv[i] + 6;
+         unsigned a = 0, b = 0, c = 0;
+         VkRayTracingShaderGroupTypeKHR type;
+         uint32_t general = VK_SHADER_UNUSED_KHR, chit = VK_SHADER_UNUSED_KHR;
+         uint32_t ahit = VK_SHADER_UNUSED_KHR, isect = VK_SHADER_UNUSED_KHR;
+
+         if (!strncmp(spec, "g=", 2) && sscanf(spec + 2, "%u", &a) == 1) {
+            type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+            general = a;
+         } else if (!strncmp(spec, "h=", 2)) {
+
+            const int got = sscanf(spec + 2, "%u,%u,%u", &a, &b, &c);
+
+            if (got < 1) {
+               fprintf(stderr, "bad hit group '%s' (want group:h=chit[,ahit[,isect]])\n", argv[i]);
+               status = 2;
+               goto cleanup;
+            }
+
+            chit = a;
+            if (got >= 2)
+               ahit = b;
+            if (got >= 3)
+               isect = c;
+
+            type = got >= 3 ? VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR
+                            : VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+         } else {
+            fprintf(stderr, "bad group '%s' (want group:g=N or group:h=chit[,ahit[,isect]])\n",
+                    argv[i]);
+            status = 2;
+            goto cleanup;
+         }
+
+         groups[ng].sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
+         groups[ng].type = type;
+         groups[ng].generalShader = general;
+         groups[ng].closestHitShader = chit;
+         groups[ng].anyHitShader = ahit;
+         groups[ng].intersectionShader = isect;
+         ng++;
+         continue;
+      }
 
       /* Split from the RIGHT: the last two fields are the stage and the entrypoint, so a path that
        * contains a colon itself (a Windows drive letter) still parses. */
@@ -301,7 +369,24 @@ run_rt_pipeline(int argc, char **argv, s2i_target target, int compile_traversal)
    char *isa = NULL, *msg = NULL;
    s2i_stats stats = {0};
 
-   const s2i_pipeline pipeline = { .target = target };
+   for (size_t i = 0; i < n; i++) {
+      stage_infos[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+      stage_infos[i].stage = s2i_stage_to_vk(shaders[i].stage);
+      stage_infos[i].pName = shaders[i].entry;
+   }
+
+   const VkRayTracingPipelineCreateInfoKHR rt_ci = {
+      .sType = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR,
+      .stageCount = (uint32_t)n,
+      .pStages = stage_infos,
+      .groupCount = (uint32_t)ng,
+      .pGroups = groups,
+   };
+
+   const s2i_pipeline pipeline = {
+      .target = target,
+      .ray_tracing = ng ? &rt_ci : NULL,
+   };
 
    s2i_result r =
       s2i_compile_rt_pipeline(shaders, n, 0, compile_traversal, &pipeline, &isa, &stats, &msg);
@@ -338,6 +423,8 @@ cleanup:
 
    free(shaders);
    free(bufs);
+   free(groups);
+   free(stage_infos);
 
    return status;
 }
@@ -378,7 +465,12 @@ main(int argc, char **argv)
       fprintf(stderr, "gfx keys: stages=vs,hs,ds,gs,ps,task,mesh (whole pipeline, default vs,ps)\n"
                       "          samples=N  sample-shading=0|1  alpha-to-coverage=0|1\n"
                       "          view-mask=N  patch-points=N\n");
-      fprintf(stderr, "       %s <target> rtpipe[-trav] <spv:stage:entry> ...\n", argv[0]);
+      fprintf(stderr, "       %s <target> rtpipe[-trav] <spv:stage:entry> ... [group:...]\n"
+                      "         group:g=N          general group over shader N\n"
+                      "         group:h=C[,A[,I]]  hit group: closest-hit, any-hit, intersection\n"
+                      "         shaders are numbered in the order given; with no group declared,\n"
+                      "         one group per shader is synthesized, no hit group possible\n",
+              argv[0]);
       fprintf(stderr, "       %s list [--verbose]\n", argv[0]);
       fprintf(stderr, "targets:\n");
       print_targets(stderr, 0);

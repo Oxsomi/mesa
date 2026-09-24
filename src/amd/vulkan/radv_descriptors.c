@@ -38,12 +38,13 @@ radv_descriptor_alignment(VkDescriptorType type)
    }
 }
 
+/* The sizing depends on the physical device only, so a caller that has no logical device (an
+ * offline compile) can reach it too. The device-taking form below stays for the driver's callers. */
 bool
-radv_mutable_descriptor_type_size_alignment(const struct radv_device *device,
-                                            const VkMutableDescriptorTypeListEXT *list, uint64_t *out_size,
-                                            uint64_t *out_align)
+radv_mutable_descriptor_type_size_alignment_pdev(const struct radv_physical_device *pdev,
+                                                 const VkMutableDescriptorTypeListEXT *list, uint64_t *out_size,
+                                                 uint64_t *out_align)
 {
-   const struct radv_physical_device *pdev = radv_device_physical(device);
    uint32_t max_size = 0;
    uint32_t max_align = 0;
 
@@ -79,6 +80,14 @@ radv_mutable_descriptor_type_size_alignment(const struct radv_device *device,
    *out_size = max_size;
    *out_align = max_align;
    return true;
+}
+
+bool
+radv_mutable_descriptor_type_size_alignment(const struct radv_device *device,
+                                            const VkMutableDescriptorTypeListEXT *list, uint64_t *out_size,
+                                            uint64_t *out_align)
+{
+   return radv_mutable_descriptor_type_size_alignment_pdev(radv_device_physical(device), list, out_size, out_align);
 }
 
 /* VK_EXT_descriptor_buffer */

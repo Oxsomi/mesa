@@ -254,6 +254,16 @@ typedef struct s2i_pipeline {
     * what a shader-object compile does. Ignored for compute and ray tracing. */
    const VkGraphicsPipelineCreateInfo *graphics;
 
+   /* The ray tracing pipeline these shaders belong to, as a Vulkan pipeline declares it. Only the
+    * groups are read: a group says which shader it recurses into, and which any-hit and
+    * intersection shaders it carries, which is what decides whether an any-hit shader is inlined
+    * into the traversal at all. Its shader indices (generalShader, closestHitShader, anyHitShader,
+    * intersectionShader) index the `shaders` array passed alongside, in that order, so pStages and
+    * that array have to describe the same shaders. NULL synthesizes one general or hit group per
+    * shader, which cannot express a real hit group, so an any-hit or intersection shader is refused
+    * rather than compiled against a group that drops it. Only s2i_compile_rt_pipeline reads it. */
+   const VkRayTracingPipelineCreateInfoKHR *ray_tracing;
+
 } s2i_pipeline;
 
 /*

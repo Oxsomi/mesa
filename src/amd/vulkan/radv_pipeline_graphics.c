@@ -503,12 +503,6 @@ radv_get_attrib_stride(const VkPipelineVertexInputStateCreateInfo *vi, uint32_t 
    return 0;
 }
 
-#define ALL_GRAPHICS_LIB_FLAGS                                                                                         \
-   (VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT |                                                      \
-    VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT |                                                   \
-    VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT |                                                             \
-    VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT)
-
 static VkGraphicsPipelineLibraryFlagBitsEXT
 shader_stage_to_pipeline_library_flags(VkShaderStageFlagBits stage)
 {
@@ -1612,7 +1606,7 @@ radv_pipeline_generate_ps_epilog_key(const struct radv_compiler_info *compiler_i
    return radv_generate_ps_epilog_key(compiler_info, &ps_epilog);
 }
 
-static struct radv_graphics_state_key
+struct radv_graphics_state_key
 radv_generate_graphics_state_key(const struct radv_compiler_info *compiler_info,
                                  const struct vk_graphics_pipeline_state *state,
                                  VkGraphicsPipelineLibraryFlagBitsEXT lib_flags, uint32_t custom_blend_mode)
